@@ -1,6 +1,11 @@
 """Run during setup to auto-detect capture card audio and save to config."""
 import json, os, sys
-sys.path.insert(0, r"C:\ContentCapture_v2\venv\Lib\site-packages")
+
+# Prefer the venv co-located with this script; fall back to any installed sounddevice.
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_venv_site = os.path.join(_script_dir, "venv", "Lib", "site-packages")
+if os.path.isdir(_venv_site):
+    sys.path.insert(0, _venv_site)
 
 try:
     import sounddevice as sd
