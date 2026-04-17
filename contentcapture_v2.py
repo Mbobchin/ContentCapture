@@ -573,6 +573,7 @@ DEFAULT_CONFIG = {
     "recording_audio_bitrate": 320,
     # Microphone input (independent from capture card audio)
     "mic_index": None,
+    "mic_enabled": False,   # BUG1: mic is OFF by default; must be explicitly enabled
     "mic_muted": False,
     "mic_volume": 1.0,
 }
@@ -656,22 +657,50 @@ def apply_filters(frame, sharpen, deinterlace):
     return frame
 
 # ── DEVICE DETECT ─────────────────────────────────────────────────────────────
+# Module-level device caches — populated once at startup / on explicit refresh.
+_CACHED_VIDEO_DEVICES = None
+_CACHED_AUDIO_DEVICES = None  # list of (index, sd_device_dict) for ALL audio devices
+
 def find_video_devices():
+    """Return list of (index, name_str) for available video capture devices.
+    Results are cached after the first scan; call _refresh_device_cache() to rescan."""
+    global _CACHED_VIDEO_DEVICES
+    if _CACHED_VIDEO_DEVICES is not None:
+        return _CACHED_VIDEO_DEVICES
     devs=[]
     for i in range(8):
         cap=cv2.VideoCapture(i,cv2.CAP_MSMF)
         if cap.isOpened():
             w=int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); h=int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             devs.append((i,f"Device {i} ({w}x{h})")); cap.release()
+    _CACHED_VIDEO_DEVICES = devs
     return devs
 
 def find_audio_devices():
-    devs=[]
+    """Return list of (index, name_str) for audio INPUT devices.
+    Results are cached; call _refresh_device_cache() to rescan."""
+    global _CACHED_AUDIO_DEVICES
+    if _CACHED_AUDIO_DEVICES is not None:
+        return [(i, d["name"]) for i, d in _CACHED_AUDIO_DEVICES if d["max_input_channels"] > 0]
+    _populate_audio_cache()
+    return [(i, d["name"]) for i, d in _CACHED_AUDIO_DEVICES if d["max_input_channels"] > 0]
+
+def _populate_audio_cache():
+    """Scan sounddevice and fill _CACHED_AUDIO_DEVICES with (index, device_dict) pairs."""
+    global _CACHED_AUDIO_DEVICES
+    devs = []
     try:
-        for i,d in enumerate(sd.query_devices()):
-            if d["max_input_channels"]>0: devs.append((i,d["name"]))
-    except Exception: pass
-    return devs
+        for i, d in enumerate(sd.query_devices()):
+            devs.append((i, d))
+    except Exception:
+        pass
+    _CACHED_AUDIO_DEVICES = devs
+
+def _refresh_device_cache():
+    """Clear both device caches so the next call to find_*_devices() rescans."""
+    global _CACHED_VIDEO_DEVICES, _CACHED_AUDIO_DEVICES
+    _CACHED_VIDEO_DEVICES = None
+    _CACHED_AUDIO_DEVICES = None
 
 # ── PERF TRACKER ──────────────────────────────────────────────────────────────
 class PerfTracker:
@@ -893,21 +922,86 @@ class AudioEngine:
             else:
                 outdata[:] = processed
 
-        for in_dev,out_dev in [(self.input_idx,self.output_idx),(self.input_idx,None),(None,None)]:
+        # Resolve input/output indices — never leave as None when a preference exists.
+        # sounddevice may silently pick the system microphone if we pass None.
+        resolved_in  = self.input_idx  if self.input_idx  is not None else sd.default.device[0]
+        resolved_out = self.output_idx if self.output_idx is not None else sd.default.device[1]
+
+        attempt_pairs = [
+            (resolved_in,  self.output_idx if self.output_idx is not None else resolved_out),
+            (resolved_in,  resolved_out),
+            (resolved_in,  sd.default.device[1]),
+            (sd.default.device[0], sd.default.device[1]),
+        ]
+
+        for in_dev, out_dev in attempt_pairs:
             try:
-                di=sd.query_devices(in_dev if in_dev is not None else sd.default.device[0])
-                ch=min(2,int(di["max_input_channels"]))
-                self._stream=sd.Stream(samplerate=sr,channels=ch,dtype="float32",
-                                       device=(in_dev,out_dev),callback=callback,blocksize=2048)
-                self._stream.start()
-                print(f"[Audio] Started — input:{in_dev} output:{out_dev} channels:{ch} rate:{sr}"); return
-            except Exception as e: print(f"[Audio] Attempt failed (in:{in_dev} out:{out_dev}): {e}")
-        print("[Audio] All attempts failed — running without audio")
+                # Log the actual device name so users can verify in console
+                in_info  = sd.query_devices(in_dev  if in_dev  is not None else sd.default.device[0])
+                out_info = sd.query_devices(out_dev if out_dev is not None else sd.default.device[1])
+                print(f"[Audio] Opening input: {in_info['name']!r}, output: {out_info['name']!r}")
+                ch = min(2, int(in_info["max_input_channels"]))
+                if ch == 0:
+                    print(f"[Audio] Device {in_dev!r} has no input channels - skipping")
+                    continue
+
+                # BUG 1 FIX: Use separate InputStream + OutputStream instead of duplex
+                # sd.Stream fails when input and output are on different PortAudio host
+                # APIs (e.g. WASAPI input + MME output) with error -9993.
+                _out_stream_ref = [None]
+
+                def _in_callback(indata, frames, time_info, status):
+                    fake_out = np.zeros_like(indata)
+                    callback(indata, fake_out, frames, time_info, status)
+                    out_s = _out_stream_ref[0]
+                    if out_s is not None and out_s.active:
+                        try:
+                            out_s.write(fake_out)
+                        except Exception:
+                            pass
+
+                out_ch = min(2, int(out_info["max_output_channels"])) or ch
+                self._out_stream = sd.OutputStream(
+                    samplerate=sr, channels=out_ch, dtype="float32",
+                    device=out_dev, blocksize=2048
+                )
+                self._out_stream.start()
+                _out_stream_ref[0] = self._out_stream
+
+                self._in_stream = sd.InputStream(
+                    samplerate=sr, channels=ch, dtype="float32",
+                    device=in_dev, callback=_in_callback, blocksize=2048
+                )
+                self._in_stream.start()
+                # Keep _stream pointing to the input stream for backwards compatibility
+                self._stream = self._in_stream
+
+                print(f"[Audio] Started - input:{in_dev} output:{out_dev} channels:{ch} rate:{sr}")
+                return
+            except Exception as e:
+                print(f"[Audio] Attempt failed (in:{in_dev} out:{out_dev}): {e}")
+                # Clean up any partially opened streams before retrying
+                try:
+                    if hasattr(self, '_out_stream') and self._out_stream is not None:
+                        self._out_stream.stop(); self._out_stream.close()
+                        self._out_stream = None
+                except Exception:
+                    pass
+                if in_dev == self.input_idx and self.input_idx is not None:
+                    print(f"[Audio] NOTE: Configured input device index {self.input_idx} failed. "
+                          f"Check Device Settings -> Audio input.")
+        print("[Audio] All attempts failed - running without audio")
     def stop(self):
-        if self._stream:
-            try: self._stream.stop(); self._stream.close()
+        # BUG 1 FIX: Stop and close both the input and output streams separately.
+        if hasattr(self, '_in_stream') and self._in_stream is not None:
+            try: self._in_stream.stop(); self._in_stream.close()
             except Exception: pass
-            self._stream=None
+            self._in_stream = None
+        if hasattr(self, '_out_stream') and self._out_stream is not None:
+            try: self._out_stream.stop(); self._out_stream.close()
+            except Exception: pass
+            self._out_stream = None
+        self._stream = None
     def set_volume(self,v):
         with self._lock: self.volume=float(v)
     def toggle_mute(self):
@@ -944,15 +1038,19 @@ class MicEngine:
         self._recorder_ref = recorder_or_none
 
     def start(self):
+        # BUG1: Only start if BOTH a device is selected AND mic_enabled is True.
+        # This prevents any audio from being captured on launch when mic is disabled.
         idx = self._cfg.get("mic_index", None)
         sr  = self._cfg.get("audio_sample_rate", 48000)
-        if idx is None:
-            return   # no mic configured — do nothing
+        if idx is None or not self._cfg.get("mic_enabled", False):
+            return   # mic not configured or explicitly disabled — do nothing
 
         engine = self
 
         def _make_callback(stereo):
             def callback(indata, frames, time_info, status):
+                # BUG2: check mute BEFORE writing to the recorder — when muted,
+                # neither monitoring output nor the recording gets mic audio.
                 if engine.muted:
                     return
                 with engine._lock:
@@ -964,6 +1062,7 @@ class MicEngine:
                     chunk = np.column_stack([indata, indata]) * vol
                 np.clip(chunk, -1.0, 1.0, out=chunk)
                 engine._buf.append(chunk.copy())
+                # Only feed the recorder when NOT muted (mute check already passed above)
                 rec = engine._recorder_ref
                 if rec is not None:
                     try:
@@ -1486,7 +1585,7 @@ class AudioDialog(BaseDialog):
         self.cfg=cfg
         self._audio_engine=audio
         self._mic=mic
-        self.setMinimumWidth(520)
+        self.setMinimumWidth(560)
         layout=QVBoxLayout(self); layout.setSpacing(16); layout.setContentsMargins(20,20,20,20)
 
         # Header
@@ -1494,6 +1593,72 @@ class AudioDialog(BaseDialog):
         hdr.setStyleSheet(f"color:{C['accent']};font-size:13pt;font-weight:bold;letter-spacing:1.5px;background:transparent;")
         layout.addWidget(hdr)
         layout.addWidget(self._divider())
+
+        # ── BUG4: Capture Card Audio group (moved from DeviceDialog) ─────────
+        grp_cc = self._section("Capture Card Audio"); gcc = QVBoxLayout(grp_cc)
+        gcc.setSpacing(12); gcc.setContentsMargins(12, 16, 12, 12)
+
+        cc_note_top = QLabel("Stream restart required after changing devices.")
+        cc_note_top.setStyleSheet(f"color:{C['warning']};font-size:9pt;background:transparent;")
+        gcc.addWidget(cc_note_top)
+
+        gcc_form = QFormLayout(); gcc_form.setSpacing(10)
+        gcc_form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+        # Collect all audio devices from cache
+        _all_audio = []
+        try:
+            global _CACHED_AUDIO_DEVICES
+            if _CACHED_AUDIO_DEVICES is None:
+                _populate_audio_cache()
+            _all_audio = _CACHED_AUDIO_DEVICES or []
+        except Exception:
+            pass
+
+        # Audio Input combo (capture card input)
+        self._cc_in_combo = QComboBox()
+        self._cc_in_combo.setToolTip(
+            "Select the audio output of your capture card device.\n"
+            "This is what you HEAR from the game/console.")
+        saved_in = cfg.get("audio_input_index", 3)
+        for i, d in _all_audio:
+            if d["max_input_channels"] > 0:
+                label = f"{d['name'][:52]} ({i})"
+                self._cc_in_combo.addItem(label, i)
+                if i == saved_in:
+                    self._cc_in_combo.setCurrentIndex(self._cc_in_combo.count() - 1)
+        if self._cc_in_combo.count() == 0:
+            self._cc_in_combo.addItem("No audio input devices found", None)
+
+        lbl_cc_in = QLabel("Capture Card Input:")
+        lbl_cc_in.setStyleSheet(f"color:{C['text2']};font-size:10pt;")
+        gcc_form.addRow(lbl_cc_in, self._cc_in_combo)
+        hint_cc_in = QLabel("Select the audio output of your capture card device")
+        hint_cc_in.setStyleSheet(f"color:{C['subtext']};font-size:9pt;background:transparent;")
+        gcc_form.addRow("", hint_cc_in)
+
+        # Audio Output combo (monitoring)
+        self._cc_out_combo = QComboBox()
+        self._cc_out_combo.setToolTip(
+            "Where you hear the capture card audio (your headphones or speakers).")
+        self._cc_out_combo.addItem("System default", None)
+        saved_out = cfg.get("audio_output_index", None)
+        for i, d in _all_audio:
+            if d["max_output_channels"] > 0:
+                label = f"{d['name'][:52]} ({i})"
+                self._cc_out_combo.addItem(label, i)
+                if i == saved_out:
+                    self._cc_out_combo.setCurrentIndex(self._cc_out_combo.count() - 1)
+
+        lbl_cc_out = QLabel("Monitoring Output:")
+        lbl_cc_out.setStyleSheet(f"color:{C['text2']};font-size:10pt;")
+        gcc_form.addRow(lbl_cc_out, self._cc_out_combo)
+        hint_cc_out = QLabel("Where you hear the capture card audio (headphones / speakers)")
+        hint_cc_out.setStyleSheet(f"color:{C['subtext']};font-size:9pt;background:transparent;")
+        gcc_form.addRow("", hint_cc_out)
+
+        gcc.addLayout(gcc_form)
+        layout.addWidget(grp_cc)
 
         # Volume section
         grp=self._section("Volume & Monitoring"); gl=QFormLayout(grp); gl.setSpacing(14)
@@ -1624,6 +1789,20 @@ class AudioDialog(BaseDialog):
         grp_mic = self._section("Microphone Input"); gmic = QVBoxLayout(grp_mic)
         gmic.setSpacing(12); gmic.setContentsMargins(12, 16, 12, 12)
 
+        # BUG1: Prominent "Enable Microphone" checkbox at the top of the group
+        self._mic_enabled_chk = QCheckBox("Enable Microphone")
+        self._mic_enabled_chk.setChecked(cfg.get("mic_enabled", False))
+        self._mic_enabled_chk.setToolTip(
+            "When unchecked the microphone is completely silent — no audio captured at all.")
+        self._mic_enabled_chk.setStyleSheet("font-weight:bold;font-size:10pt;")
+        gmic.addWidget(self._mic_enabled_chk)
+
+        # Container widget for device/mute/volume controls — greys out when disabled
+        mic_controls_widget = QWidget()
+        mic_controls_inner = QVBoxLayout(mic_controls_widget)
+        mic_controls_inner.setContentsMargins(0, 0, 0, 0)
+        mic_controls_inner.setSpacing(10)
+
         # Device selector
         mic_dev_row = QHBoxLayout(); mic_dev_row.setSpacing(8)
         mic_dev_lbl = QLabel("Device:")
@@ -1637,7 +1816,9 @@ class AudioDialog(BaseDialog):
         capture_idx = cfg.get("audio_input_index", -1)
         self._mic_combo.addItem("None (disabled)", None)
         try:
-            for i, d in enumerate(sd.query_devices()):
+            if _CACHED_AUDIO_DEVICES is None:
+                _populate_audio_cache()
+            for i, d in (_CACHED_AUDIO_DEVICES or []):
                 if d["max_input_channels"] > 0:
                     marker = "  [capture card]" if i == capture_idx else ""
                     self._mic_combo.addItem(
@@ -1659,7 +1840,7 @@ class AudioDialog(BaseDialog):
         self._mic_combo.currentIndexChanged.connect(_on_mic_device_changed)
         mic_dev_row.addWidget(mic_dev_lbl)
         mic_dev_row.addWidget(self._mic_combo, 1)
-        gmic.addLayout(mic_dev_row)
+        mic_controls_inner.addLayout(mic_dev_row)
 
         # Mute button — live toggle (survives dialog close via the MicEngine reference)
         self._mic_mute_btn = QPushButton()
@@ -1687,7 +1868,7 @@ class AudioDialog(BaseDialog):
         self._mic_mute_btn.setToolTip("Toggle microphone mute without restarting the stream")
         self._mic_mute_btn.clicked.connect(_toggle_mic_mute_btn)
         _refresh_mic_btn()
-        gmic.addWidget(self._mic_mute_btn)
+        mic_controls_inner.addWidget(self._mic_mute_btn)
 
         # Volume row: slider + spinbox (0–200%)
         mic_vol_row = QHBoxLayout(); mic_vol_row.setSpacing(10)
@@ -1728,7 +1909,7 @@ class AudioDialog(BaseDialog):
         mic_vol_row.addWidget(mic_vol_lbl)
         mic_vol_row.addWidget(self._mic_vol_slider, 1)
         mic_vol_row.addWidget(self._mic_vol_spin)
-        gmic.addLayout(mic_vol_row)
+        mic_controls_inner.addLayout(mic_vol_row)
 
         mic_note = QLabel(
             "Changes to device selection take effect on the next stream restart.\n"
@@ -1736,9 +1917,27 @@ class AudioDialog(BaseDialog):
         )
         mic_note.setWordWrap(True)
         mic_note.setStyleSheet(f"color:{C['subtext']};font-size:9pt;background:transparent;")
-        gmic.addWidget(mic_note)
+        mic_controls_inner.addWidget(mic_note)
 
+        gmic.addWidget(mic_controls_widget)
         layout.addWidget(grp_mic)
+
+        # BUG1: Wire Enable checkbox — grey out sub-controls and start/stop mic live
+        def _on_mic_enabled_toggled(checked):
+            mic_controls_widget.setEnabled(checked)
+            cfg["mic_enabled"] = checked
+            if mic is not None:
+                if checked:
+                    # Only start if stream is running (MainWindow sets cfg before calling start)
+                    if not mic.is_running():
+                        mic._cfg["mic_enabled"] = True
+                        mic.start()
+                else:
+                    mic.stop()
+
+        self._mic_enabled_chk.toggled.connect(_on_mic_enabled_toggled)
+        # Apply initial enabled state to sub-controls
+        mic_controls_widget.setEnabled(cfg.get("mic_enabled", False))
 
         # Info note
         note=QLabel("Volume above 100% amplifies the signal (may clip).")
@@ -1765,10 +1964,14 @@ class AudioDialog(BaseDialog):
     def accept(self):
         self.cfg["audio_sample_rate"] = self.sr_combo.currentData()
         self.cfg["audio_delay_ms"]    = self.sync_spin.value()
+        # BUG4: Capture card audio device selections
+        self.cfg["audio_input_index"]  = self._cc_in_combo.currentData()
+        self.cfg["audio_output_index"] = self._cc_out_combo.currentData()
         # Mic settings (device & muted already updated live; persist final values)
-        self.cfg["mic_index"]  = self._mic_combo.currentData()
-        self.cfg["mic_muted"]  = self._mic_muted
-        self.cfg["mic_volume"] = self._mic_vol_spin.value() / 100.0
+        self.cfg["mic_enabled"] = self._mic_enabled_chk.isChecked()
+        self.cfg["mic_index"]   = self._mic_combo.currentData()
+        self.cfg["mic_muted"]   = self._mic_muted
+        self.cfg["mic_volume"]  = self._mic_vol_spin.value() / 100.0
         self.close()
 
 class ImageDialog(BaseDialog):
@@ -2083,7 +2286,7 @@ class RecordingDialog(BaseDialog):
 class DeviceDialog(BaseDialog):
     def __init__(self,parent,cfg):
         super().__init__(parent,"Device Settings"); self.cfg=cfg
-        self.setMinimumWidth(520)
+        self.setMinimumWidth(560)
         layout=QVBoxLayout(self); layout.setSpacing(16); layout.setContentsMargins(20,20,20,20)
 
         hdr=QLabel("\u2699  DEVICE SETTINGS")
@@ -2096,28 +2299,41 @@ class DeviceDialog(BaseDialog):
         gfl.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
         gfl.setContentsMargins(12,16,12,12)
 
-        # Video device
-        self.vid_combo=QComboBox()
-        self.vid_combo.setToolTip("Select the capture card or camera to use as video source")
-        vdevs=find_video_devices()
-        for idx,name in vdevs:
-            self.vid_combo.addItem(f"\U0001f4f9  {name}",idx)
-            if idx==cfg.get("video_index",0): self.vid_combo.setCurrentIndex(self.vid_combo.count()-1)
-        if self.vid_combo.count()==0: self.vid_combo.addItem("No video devices found",0)
-        vid_row=QHBoxLayout(); vid_row.setSpacing(6)
-        vid_row.addWidget(self.vid_combo,1)
-        refresh_btn=QPushButton("\u21ba"); refresh_btn.setFixedWidth(36)
-        refresh_btn.setToolTip("Rescan for video devices")
-        def _refresh_vid():
+        # BUG5: Use cached video devices — instant on first open after startup pre-scan
+        # BUG6: Format labels as "[index] name" for clarity
+        def _build_vid_combo():
             self.vid_combo.clear()
-            for idx,name in find_video_devices():
-                self.vid_combo.addItem(f"\U0001f4f9  {name}",idx)
-            if self.vid_combo.count()==0: self.vid_combo.addItem("No video devices found",0)
-        refresh_btn.clicked.connect(_refresh_vid)
+            for idx, name in find_video_devices():
+                self.vid_combo.addItem(f"\U0001f4f9  [{idx}] {name}", idx)
+                if idx == cfg.get("video_index", 0):
+                    self.vid_combo.setCurrentIndex(self.vid_combo.count() - 1)
+            if self.vid_combo.count() == 0:
+                self.vid_combo.addItem("No video devices found", 0)
+
+        self.vid_combo = QComboBox()
+        self.vid_combo.setToolTip("Select your capture card or camera as the video source")
+        _build_vid_combo()
+
+        vid_row = QHBoxLayout(); vid_row.setSpacing(6)
+        vid_row.addWidget(self.vid_combo, 1)
+
+        # BUG5: Refresh button clears cache and rescans
+        refresh_btn = QPushButton("\u21ba  Refresh Devices"); refresh_btn.setFixedWidth(140)
+        refresh_btn.setToolTip("Clear device cache and rescan for new capture cards / audio interfaces")
+        def _refresh_all():
+            _refresh_device_cache()
+            _build_vid_combo()
+            _build_aud_combos()
+        refresh_btn.clicked.connect(_refresh_all)
         vid_row.addWidget(refresh_btn)
-        vw=QWidget(); vw.setLayout(vid_row)
-        lbl_vid=QLabel("Video device:"); lbl_vid.setStyleSheet(f"color:{C['text2']};font-size:10pt;")
+        vw = QWidget(); vw.setLayout(vid_row)
+        lbl_vid = QLabel("Video device:"); lbl_vid.setStyleSheet(f"color:{C['text2']};font-size:10pt;")
         gfl.addRow(lbl_vid, vw)
+
+        # BUG6: "What to select" tip below video combo
+        vid_tip = QLabel("Select your capture card (usually 'USB Video' or 'USB Capture')")
+        vid_tip.setStyleSheet(f"color:{C['subtext']};font-size:9pt;background:transparent;")
+        gfl.addRow("", vid_tip)
 
         # Resolution + FPS linked dropdowns
         res_fps_row=QHBoxLayout(); res_fps_row.setSpacing(10)
@@ -2136,31 +2352,62 @@ class DeviceDialog(BaseDialog):
         lbl_res=QLabel("Resolution / FPS:"); lbl_res.setStyleSheet(f"color:{C['text2']};font-size:10pt;")
         gfl.addRow(lbl_res, rfw)
 
-        # Audio input device
-        self.aud_combo=QComboBox()
-        self.aud_combo.setToolTip("Select the audio input device connected to the capture card")
-        all_audio_devs=[]
-        try: all_audio_devs=list(enumerate(sd.query_devices()))
-        except Exception: pass
-        for idx,d in all_audio_devs:
-            if d["max_input_channels"]>0:
-                self.aud_combo.addItem(f"\U0001f50a  [{idx}] {d['name'][:50]}",idx)
-                if idx==cfg.get("audio_input_index",3): self.aud_combo.setCurrentIndex(self.aud_combo.count()-1)
-        if self.aud_combo.count()==0: self.aud_combo.addItem("No audio input devices found",0)
-        lbl_aud=QLabel("Audio input:"); lbl_aud.setStyleSheet(f"color:{C['text2']};font-size:10pt;")
-        gfl.addRow(lbl_aud, self.aud_combo)
+        # BUG5/BUG6: Audio device combos — use cache, format "[index] name (Nch)"
+        self.aud_combo = QComboBox()
+        self.aud_combo.setToolTip(
+            "Select the audio output of your capture card\n"
+            "(also configurable in Audio Settings → Capture Card Audio)")
+        self.aud_out_combo = QComboBox()
+        self.aud_out_combo.setToolTip(
+            "Select your headphones or speakers for monitoring\n"
+            "(also configurable in Audio Settings → Capture Card Audio)")
 
-        # Audio output device
-        self.aud_out_combo=QComboBox()
-        self.aud_out_combo.setToolTip("Select the audio output / playback device (system default if not set)")
-        self.aud_out_combo.addItem("\U0001f508  System default",None)
-        saved_out=cfg.get("audio_output_index",None)
-        for idx,d in all_audio_devs:
-            if d["max_output_channels"]>0:
-                self.aud_out_combo.addItem(f"\U0001f508  [{idx}] {d['name'][:50]}",idx)
-                if idx==saved_out: self.aud_out_combo.setCurrentIndex(self.aud_out_combo.count()-1)
-        lbl_aud_out=QLabel("Audio output:"); lbl_aud_out.setStyleSheet(f"color:{C['text2']};font-size:10pt;")
+        def _build_aud_combos():
+            self.aud_combo.clear()
+            self.aud_out_combo.clear()
+            self.aud_out_combo.addItem("\U0001f508  System default", None)
+
+            global _CACHED_AUDIO_DEVICES
+            if _CACHED_AUDIO_DEVICES is None:
+                _populate_audio_cache()
+            all_devs = _CACHED_AUDIO_DEVICES or []
+
+            saved_in  = cfg.get("audio_input_index",  3)
+            saved_out = cfg.get("audio_output_index", None)
+
+            for idx, d in all_devs:
+                # BUG6: "[index] name (Nch)" format for input
+                if d["max_input_channels"] > 0:
+                    ch = int(d["max_input_channels"])
+                    label = f"\U0001f50a  [{idx}] {d['name'][:46]} ({ch}ch)"
+                    self.aud_combo.addItem(label, idx)
+                    if idx == saved_in:
+                        self.aud_combo.setCurrentIndex(self.aud_combo.count() - 1)
+                # BUG6: "[index] name" format for output
+                if d["max_output_channels"] > 0:
+                    label = f"\U0001f508  [{idx}] {d['name'][:50]}"
+                    self.aud_out_combo.addItem(label, idx)
+                    if idx == saved_out:
+                        self.aud_out_combo.setCurrentIndex(self.aud_out_combo.count() - 1)
+
+            if self.aud_combo.count() == 0:
+                self.aud_combo.addItem("No audio input devices found", 0)
+
+        _build_aud_combos()
+
+        lbl_aud = QLabel("Audio input:"); lbl_aud.setStyleSheet(f"color:{C['text2']};font-size:10pt;")
+        gfl.addRow(lbl_aud, self.aud_combo)
+        # BUG6: tip below audio input
+        aud_in_tip = QLabel("Select the audio output of your capture card  (also in Audio Settings)")
+        aud_in_tip.setStyleSheet(f"color:{C['subtext']};font-size:9pt;background:transparent;")
+        gfl.addRow("", aud_in_tip)
+
+        lbl_aud_out = QLabel("Audio output:"); lbl_aud_out.setStyleSheet(f"color:{C['text2']};font-size:10pt;")
         gfl.addRow(lbl_aud_out, self.aud_out_combo)
+        # BUG6: tip below audio output
+        aud_out_tip = QLabel("Select your headphones or speakers for monitoring  (also in Audio Settings)")
+        aud_out_tip.setStyleSheet(f"color:{C['subtext']};font-size:9pt;background:transparent;")
+        gfl.addRow("", aud_out_tip)
 
         layout.addWidget(grp)
 
@@ -3340,6 +3587,15 @@ def main():
     except ImportError: pass
     app=QApplication(sys.argv)
     app.setApplicationName(APP_NAME); app.setApplicationVersion(APP_VERSION); app.setStyle("Fusion")
+
+    # BUG5: Pre-populate device caches before creating MainWindow so DeviceDialog
+    # and AudioDialog open instantly on first use (no blocking scan on UI thread).
+    print("[Startup] Scanning video devices…")
+    find_video_devices()
+    print("[Startup] Scanning audio devices…")
+    _populate_audio_cache()
+    print("[Startup] Device scan complete.")
+
     win=MainWindow(); win.show(); sys.exit(app.exec())
 
 if __name__=="__main__":
