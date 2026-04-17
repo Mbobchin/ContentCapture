@@ -4,6 +4,7 @@ Native Windows — PySide6 + MSMF + WASAPI
 No WSL, no usbipd, no PulseAudio.
 """
 import sys, os, cv2, time, threading, collections, json, subprocess
+import queue, wave
 import numpy as np
 import sounddevice as sd
 from datetime import datetime
@@ -15,11 +16,12 @@ from PySide6.QtWidgets import (
     QGroupBox, QGridLayout, QSizePolicy, QSpinBox, QLineEdit,
     QFrame, QGraphicsOpacityEffect, QGraphicsDropShadowEffect,
     QScrollArea, QToolBar, QStatusBar, QDockWidget, QFormLayout,
-    QDoubleSpinBox, QAbstractItemView, QMenu, QSplitter, QStackedWidget
+    QDoubleSpinBox, QAbstractItemView, QMenu, QSplitter, QStackedWidget,
+    QKeySequenceEdit, QTableWidget, QTableWidgetItem, QHeaderView
 )
 from PySide6.QtCore import (
     Qt, QTimer, QThread, Signal, QPropertyAnimation, QEasingCurve,
-    QRect, QPoint, QSize, QRectF
+    QRect, QPoint, QSize, QRectF, QObject
 )
 from PySide6.QtGui import (
     QImage, QPixmap, QPainter, QColor, QFont, QLinearGradient, QPen,
@@ -549,14 +551,49 @@ def get_recommended_settings():
         print("[RAM] High memory mode — 1080p, 30s clip buffer")
         return {"clip_duration":30,"resolution":"1920x1080"}
 
+# ── FFMPEG DETECTION ─────────────────────────────────────────────────────────
+def _find_ffmpeg():
+    """Return path to ffmpeg executable, or None if not found."""
+    bundled = r"C:/ContentCapture_v2/bin/ffmpeg.exe"
+    if os.path.isfile(bundled):
+        print(f"[FFmpeg] Found bundled: {bundled}")
+        return bundled
+    # Fall back to PATH
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-version"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            print("[FFmpeg] Found on PATH")
+            return "ffmpeg"
+    except Exception:
+        pass
+    print("[FFmpeg] Not found — audio will not be included in recordings")
+    return None
+
+FFMPEG_PATH = _find_ffmpeg()
+
 DEFAULT_CONFIG = {
-    "video_index":0,"audio_input_index":3,"audio_output_index":9,
+    "video_index":0,"audio_input_index":3,"audio_output_index":None,
     "resolution":"1920x1080","fps":60,"volume":1.0,"muted":False,
     "upscale_mode":"none","sharpen":False,"deinterlace":False,
     "screenshot_path":os.path.join(os.environ.get("USERPROFILE","~"),"Pictures","ContentCapture"),
     "recording_path":os.path.join(os.environ.get("USERPROFILE","~"),"Videos","ContentCapture"),
+    "clip_path":os.path.join(os.environ.get("USERPROFILE","~"),"Videos","ContentCapture","Clips"),
     "clip_duration":30,"recording_format":"mp4",
+    "screenshot_format":"png","screenshot_jpeg_quality":92,
     "always_on_top":False,"auto_start":True,"geometry":None,"aspect_ratio_lock":True,
+    "brightness":1.0,"contrast":1.0,"saturation":1.0,
+    "audio_sample_rate":48000,
+    "audio_delay_ms":0,
+    "hotkeys":{},
+    "global_hotkeys_enabled": False,
+    "global_hotkey_actions": [],
+    # Audio recording settings
+    "recording_include_audio": True,
+    "recording_audio_codec": "aac",
+    "recording_audio_bitrate": 320,
 }
 
 def load_config():
@@ -764,29 +801,110 @@ class VideoThread(QThread):
 
 # ── AUDIO ENGINE ──────────────────────────────────────────────────────────────
 class AudioEngine:
-    def __init__(self,input_idx,output_idx=None):
+    def __init__(self,input_idx,output_idx=None,sample_rate=48000):
         self.input_idx=input_idx; self.output_idx=output_idx
+        self.sample_rate=sample_rate
         self.volume=1.0; self.muted=False; self._stream=None; self._lock=threading.Lock()
         self._audio_buf=None
-    def start(self):
-        engine=self
-        def callback(indata,outdata,frames,time_info,status):
-            if engine._audio_buf is None or engine._audio_buf.shape!=outdata.shape:
-                engine._audio_buf=np.empty_like(outdata)
+        # AV sync delay line
+        self._delay_ms=0
+        self._delay_buf=collections.deque()
+        self._samples_to_skip=0
+
+    def set_delay(self, ms: int):
+        """Set the AV sync offset in milliseconds.
+        Positive = delay audio (video is ahead); negative = skip audio ahead.
+        Safe to call from the UI thread at any time.
+        """
+        self._delay_ms = int(ms)
+        # Reset delay state; the callback reads these atomically enough
+        # because Python int assignment is atomic at the GIL level.
+        self._delay_buf.clear()
+        sr = self.sample_rate
+        samples = int(abs(self._delay_ms) / 1000.0 * sr)
+        self._samples_to_skip = samples if self._delay_ms < 0 else 0
+
+    def start(self, delay_ms: int = 0):
+        # Initialise delay state from the parameter
+        self._delay_ms = int(delay_ms)
+        self._delay_buf.clear()
+        sr = self.sample_rate
+        samples = int(abs(self._delay_ms) / 1000.0 * sr)
+        self._samples_to_skip = samples if self._delay_ms < 0 else 0
+
+        engine = self
+
+        def callback(indata, outdata, frames, time_info, status):
+            # ── Volume / mute pre-process into a scratch buffer ───────────────
+            if engine._audio_buf is None or engine._audio_buf.shape != outdata.shape:
+                engine._audio_buf = np.empty_like(outdata)
             with engine._lock:
-                if engine.muted:
-                    outdata[:]=0
+                muted  = engine.muted
+                volume = engine.volume
+
+            if muted:
+                outdata[:] = 0
+                return
+
+            np.multiply(indata, volume, out=engine._audio_buf)
+            np.clip(engine._audio_buf, -1.0, 1.0, out=engine._audio_buf)
+            processed = engine._audio_buf  # shape (frames, channels)
+
+            delay_ms = engine._delay_ms  # snapshot — primitive read, GIL-safe
+
+            # ── Pass-through (no delay) ───────────────────────────────────────
+            if delay_ms == 0:
+                outdata[:] = processed
+                return
+
+            # ── Positive delay: buffer incoming, output silence until full ────
+            if delay_ms > 0:
+                target_samples = int(delay_ms / 1000.0 * sr)
+                engine._delay_buf.append(processed.copy())
+                buffered = sum(len(c) for c in engine._delay_buf)
+                if buffered < target_samples:
+                    outdata[:] = 0
                 else:
-                    np.multiply(indata, engine.volume, out=engine._audio_buf)
-                    np.clip(engine._audio_buf, -1.0, 1.0, out=outdata)
+                    # Drain enough frames to fill outdata
+                    remaining = frames
+                    out_pos = 0
+                    while remaining > 0 and engine._delay_buf:
+                        chunk = engine._delay_buf[0]
+                        available = len(chunk)
+                        take = min(available, remaining)
+                        outdata[out_pos:out_pos + take] = chunk[:take]
+                        out_pos += take
+                        remaining -= take
+                        if take == available:
+                            engine._delay_buf.popleft()
+                        else:
+                            # Put the remainder back as the new head
+                            engine._delay_buf[0] = chunk[take:]
+                    if remaining > 0:
+                        outdata[out_pos:] = 0
+                return
+
+            # ── Negative delay: skip ahead by discarding samples ──────────────
+            # delay_ms < 0
+            if engine._samples_to_skip > 0:
+                skip = min(engine._samples_to_skip, frames)
+                engine._samples_to_skip -= skip
+                if skip < frames:
+                    outdata[:frames - skip] = processed[skip:]
+                    outdata[frames - skip:] = 0
+                else:
+                    outdata[:] = 0
+            else:
+                outdata[:] = processed
+
         for in_dev,out_dev in [(self.input_idx,self.output_idx),(self.input_idx,None),(None,None)]:
             try:
                 di=sd.query_devices(in_dev if in_dev is not None else sd.default.device[0])
                 ch=min(2,int(di["max_input_channels"]))
-                self._stream=sd.Stream(samplerate=48000,channels=ch,dtype="float32",
+                self._stream=sd.Stream(samplerate=sr,channels=ch,dtype="float32",
                                        device=(in_dev,out_dev),callback=callback,blocksize=2048)
                 self._stream.start()
-                print(f"[Audio] Started — input:{in_dev} output:{out_dev} channels:{ch}"); return
+                print(f"[Audio] Started — input:{in_dev} output:{out_dev} channels:{ch} rate:{sr}"); return
             except Exception as e: print(f"[Audio] Attempt failed (in:{in_dev} out:{out_dev}): {e}")
         print("[Audio] All attempts failed — running without audio")
     def stop(self):
@@ -802,27 +920,280 @@ class AudioEngine:
             result=self.muted
         return result
 
+# ── AUDIO RECORDER ───────────────────────────────────────────────────────────
+class AudioRecorder:
+    """
+    Captures raw PCM float32 from a sounddevice InputStream and writes it to
+    a temporary WAV file (int16 PCM) for later muxing by VideoRecorder.
+
+    Usage:
+        rec = AudioRecorder(cfg)
+        rec.start("/tmp/audio_123.wav")
+        ...
+        rec.stop()   # flushes remaining audio and closes the file
+    """
+
+    def __init__(self, cfg):
+        self._cfg = cfg
+        self._stream = None
+        self._q: queue.Queue = queue.Queue()
+        self._thread = None
+        self._wav_path = None
+        self._wav_file = None
+        self._channels = 1
+        self._sample_rate = 48000
+        self._stop_event = threading.Event()
+        self._recording = False
+
+    # ── internal writer thread ────────────────────────────────────────────────
+    def _writer_loop(self):
+        """Drain the queue and write int16 PCM chunks to the WAV file."""
+        while not self._stop_event.is_set() or not self._q.empty():
+            try:
+                chunk = self._q.get(timeout=0.05)
+                self._write_chunk(chunk)
+            except queue.Empty:
+                continue
+        # Final flush — drain anything that arrived between stop_event.set() and here
+        while not self._q.empty():
+            try:
+                chunk = self._q.get_nowait()
+                self._write_chunk(chunk)
+            except queue.Empty:
+                break
+        if self._wav_file:
+            try:
+                self._wav_file.close()
+            except Exception:
+                pass
+            self._wav_file = None
+
+    def _write_chunk(self, data: np.ndarray):
+        """Convert float32 ndarray to int16 and append to WAV file."""
+        if self._wav_file is None:
+            return
+        try:
+            clipped = np.clip(data, -1.0, 1.0)
+            pcm16 = (clipped * 32767.0).astype(np.int16)
+            self._wav_file.writeframes(pcm16.tobytes())
+        except Exception as e:
+            print(f"[AudioRecorder] write error: {e}")
+
+    # ── sounddevice callback ──────────────────────────────────────────────────
+    def _sd_callback(self, indata, frames, time_info, status):
+        if status:
+            print(f"[AudioRecorder] sounddevice status: {status}")
+        if self._recording:
+            self._q.put(indata.copy())
+
+    # ── public API ───────────────────────────────────────────────────────────
+    def start(self, wav_path: str):
+        """Open the input stream and start writing PCM to wav_path."""
+        self._wav_path = wav_path
+        self._stop_event.clear()
+        self._recording = False
+
+        in_idx = self._cfg.get("audio_input_index", 3)
+        sr = self._cfg.get("audio_sample_rate", 48000)
+        self._sample_rate = sr
+
+        # Determine channel count from device info
+        try:
+            di = sd.query_devices(in_idx)
+            self._channels = min(2, int(di["max_input_channels"]))
+        except Exception:
+            self._channels = 1
+
+        # Open WAV file before the stream starts so the writer thread is ready
+        try:
+            os.makedirs(os.path.dirname(wav_path) or ".", exist_ok=True)
+            self._wav_file = wave.open(wav_path, "wb")
+            self._wav_file.setnchannels(self._channels)
+            self._wav_file.setsampwidth(2)           # 16-bit
+            self._wav_file.setframerate(sr)
+        except Exception as e:
+            print(f"[AudioRecorder] Could not open WAV file {wav_path}: {e}")
+            self._wav_file = None
+            return
+
+        # Start writer daemon thread
+        self._thread = threading.Thread(target=self._writer_loop, daemon=True, name="AudioRecorderWriter")
+        self._thread.start()
+
+        # Open sounddevice input stream
+        try:
+            self._stream = sd.InputStream(
+                device=in_idx,
+                samplerate=sr,
+                channels=self._channels,
+                dtype="float32",
+                blocksize=2048,
+                callback=self._sd_callback,
+            )
+            self._stream.start()
+            self._recording = True
+            print(f"[AudioRecorder] Started — device:{in_idx} ch:{self._channels} rate:{sr} -> {wav_path}")
+        except Exception as e:
+            print(f"[AudioRecorder] Failed to open input stream: {e}")
+            self._stop_event.set()
+            self._recording = False
+
+    def stop(self):
+        """Stop the stream, flush remaining audio, and close the WAV file."""
+        self._recording = False
+        if self._stream:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+        # Signal writer thread to finish flushing
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=5.0)
+        self._thread = None
+        print(f"[AudioRecorder] Stopped — WAV: {self._wav_path}")
+
+    @property
+    def wav_path(self) -> str:
+        return self._wav_path or ""
+
+
 # ── VIDEO RECORDER ────────────────────────────────────────────────────────────
 class VideoRecorder:
+    """
+    Records video frames to a file.
+
+    If FFMPEG_PATH is set and include_audio=True (with a valid wav_path),
+    frames are piped to an ffmpeg subprocess that muxes video + audio into a
+    single output file.  Otherwise, falls back to cv2.VideoWriter (silent).
+    """
+
     def __init__(self):
-        self.writer=None; self.recording=False; self.path=None; self._lock=threading.Lock()
-    def start(self,path,fps,w,h,fmt="mp4"):
+        # cv2 fallback
+        self.writer = None
+        # ffmpeg pipe mode
+        self._ffmpeg_proc = None
+        self._wav_path_to_cleanup = None
+        # shared state
+        self.recording = False
+        self.path = None
+        self._lock = threading.Lock()
+        self._use_ffmpeg = False
+
+    def start(self, path, fps, w, h, fmt="mp4",
+              include_audio=False, wav_path=None,
+              audio_codec="aac", audio_bitrate=320):
         with self._lock:
-            parent=os.path.dirname(path)
+            parent = os.path.dirname(path)
             if parent:
-                os.makedirs(parent,exist_ok=True)
-            self.writer=cv2.VideoWriter(path,cv2.VideoWriter_fourcc(*("mp4v" if fmt=="mp4" else "XVID")),fps,(w,h))
+                os.makedirs(parent, exist_ok=True)
+
+            self._use_ffmpeg = False
+            self._ffmpeg_proc = None
+            self._wav_path_to_cleanup = None
+            self.writer = None
+
+            # ── Try ffmpeg pipe mode ──────────────────────────────────────────
+            if FFMPEG_PATH and include_audio and wav_path and os.path.isfile(wav_path):
+                codec_map = {
+                    "aac":  ("aac",  f"{audio_bitrate}k"),
+                    "mp3":  ("libmp3lame", f"{audio_bitrate}k"),
+                    "pcm":  ("pcm_s16le", None),
+                }
+                acodec, abitrate = codec_map.get(audio_codec, ("aac", "320k"))
+
+                cmd = [
+                    FFMPEG_PATH, "-y",
+                    # video from stdin pipe
+                    "-f", "rawvideo",
+                    "-pix_fmt", "bgr24",
+                    "-s", f"{w}x{h}",
+                    "-r", str(fps),
+                    "-i", "pipe:0",
+                    # audio from temp WAV
+                    "-i", wav_path,
+                    # video codec
+                    "-c:v", "libx264",
+                    "-crf", "18",
+                    "-preset", "fast",
+                    # audio codec
+                    "-c:a", acodec,
+                ]
+                if abitrate:
+                    cmd += ["-b:a", abitrate]
+                cmd += ["-shortest", path]
+
+                try:
+                    self._ffmpeg_proc = subprocess.Popen(
+                        cmd,
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    self._use_ffmpeg = True
+                    self._wav_path_to_cleanup = wav_path
+                    self.recording = True
+                    self.path = path
+                    print(f"[Recorder] ffmpeg pipe mode — {w}x{h}@{fps} + audio ({acodec}) -> {path}")
+                    return
+                except Exception as e:
+                    print(f"[Recorder] ffmpeg launch failed ({e}), falling back to cv2.VideoWriter")
+                    self._ffmpeg_proc = None
+
+            # ── cv2 fallback (silent) ─────────────────────────────────────────
+            fourcc = cv2.VideoWriter_fourcc(*("mp4v" if fmt == "mp4" else "XVID"))
+            self.writer = cv2.VideoWriter(path, fourcc, fps, (w, h))
             if not self.writer.isOpened():
                 print(f"[Recorder] VideoWriter failed to open: {path}")
-                self.writer=None; return
-            self.recording=True; self.path=path
-    def write(self,frame):
+                self.writer = None
+                return
+            self.recording = True
+            self.path = path
+            if include_audio and not FFMPEG_PATH:
+                print("[Recorder] ffmpeg not found — recording without audio")
+
+    def write(self, frame):
         with self._lock:
-            if self.recording and self.writer: self.writer.write(frame)
+            if not self.recording:
+                return
+            if self._use_ffmpeg and self._ffmpeg_proc:
+                try:
+                    self._ffmpeg_proc.stdin.write(frame.tobytes())
+                except Exception as e:
+                    print(f"[Recorder] ffmpeg write error: {e}")
+            elif self.writer:
+                self.writer.write(frame)
+
     def stop(self):
         with self._lock:
-            if self.writer: self.writer.release(); self.writer=None
-            self.recording=False; path=self.path; self.path=None; return path
+            self.recording = False
+            path = self.path
+            self.path = None
+
+            if self._use_ffmpeg and self._ffmpeg_proc:
+                try:
+                    self._ffmpeg_proc.stdin.close()
+                    self._ffmpeg_proc.wait(timeout=30)
+                except Exception as e:
+                    print(f"[Recorder] ffmpeg finish error: {e}")
+                    try: self._ffmpeg_proc.kill()
+                    except Exception: pass
+                self._ffmpeg_proc = None
+                self._use_ffmpeg = False
+                # Clean up temp WAV
+                if self._wav_path_to_cleanup:
+                    try:
+                        os.remove(self._wav_path_to_cleanup)
+                    except Exception:
+                        pass
+                    self._wav_path_to_cleanup = None
+            elif self.writer:
+                self.writer.release()
+                self.writer = None
+
+            return path
 
 # ── CLIP BUFFER ───────────────────────────────────────────────────────────────
 class ClipBuffer:
@@ -1131,6 +1502,8 @@ class BaseDialog(QDialog):
 class AudioDialog(BaseDialog):
     def __init__(self,parent,cfg,audio):
         super().__init__(parent,"Audio Settings")
+        self.cfg=cfg
+        self._audio_engine=audio
         self.setMinimumWidth(500)
         layout=QVBoxLayout(self); layout.setSpacing(16); layout.setContentsMargins(20,20,20,20)
 
@@ -1205,6 +1578,66 @@ class AudioDialog(BaseDialog):
 
         layout.addWidget(grp)
 
+        # ── Sample Rate ───────────────────────────────────────────────────────
+        grp_sr=self._section("Sample Rate"); gsr=QFormLayout(grp_sr); gsr.setSpacing(12)
+        gsr.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        gsr.setContentsMargins(12,16,12,12)
+        self.sr_combo=QComboBox()
+        self.sr_combo.setToolTip("Audio sample rate — must match your capture card / interface")
+        cur_sr=cfg.get("audio_sample_rate",48000)
+        for sr in [44100,48000,96000]:
+            self.sr_combo.addItem(f"{sr} Hz",sr)
+            if sr==cur_sr: self.sr_combo.setCurrentIndex(self.sr_combo.count()-1)
+        lbl_sr=QLabel("Sample rate:"); lbl_sr.setStyleSheet(f"color:{C['text2']};font-size:10pt;")
+        gsr.addRow(lbl_sr, self.sr_combo)
+        sr_note=QLabel("Restart stream after changing sample rate.")
+        sr_note.setStyleSheet(f"color:{C['subtext']};font-size:9pt;background:transparent;")
+        gsr.addRow("",sr_note)
+        layout.addWidget(grp_sr)
+
+        # ── AV Sync Offset ────────────────────────────────────────────────────
+        grp_sync=self._section("AV Sync Offset"); gsync=QFormLayout(grp_sync); gsync.setSpacing(12)
+        gsync.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        gsync.setContentsMargins(12,16,12,12)
+
+        cur_delay=cfg.get("audio_delay_ms",0)
+        sync_row=QHBoxLayout(); sync_row.setSpacing(10)
+        self.sync_slider=QSlider(Qt.Horizontal)
+        self.sync_slider.setRange(-500,500)
+        self.sync_slider.setSingleStep(10)
+        self.sync_slider.setPageStep(50)
+        self.sync_slider.setValue(cur_delay)
+        self.sync_slider.setToolTip("Shift audio timing relative to video (-500 to +500 ms, step 10 ms)")
+        self.sync_spin=QSpinBox()
+        self.sync_spin.setRange(-500,500)
+        self.sync_spin.setSingleStep(10)
+        self.sync_spin.setSuffix(" ms")
+        self.sync_spin.setFixedWidth(88)
+        self.sync_spin.setValue(cur_delay)
+        self.sync_spin.setToolTip("Audio offset in milliseconds (negative = earlier, positive = later)")
+
+        def _on_sync_slider(v):
+            self.sync_spin.blockSignals(True); self.sync_spin.setValue(v); self.sync_spin.blockSignals(False)
+            cfg["audio_delay_ms"]=v
+            if audio: audio.set_delay(v)
+        def _on_sync_spin(v):
+            self.sync_slider.blockSignals(True); self.sync_slider.setValue(v); self.sync_slider.blockSignals(False)
+            cfg["audio_delay_ms"]=v
+            if audio: audio.set_delay(v)
+        self.sync_slider.valueChanged.connect(_on_sync_slider)
+        self.sync_spin.valueChanged.connect(_on_sync_spin)
+        sync_row.addWidget(self.sync_slider,1); sync_row.addWidget(self.sync_spin)
+        sync_widget=QWidget(); sync_widget.setLayout(sync_row)
+        lbl_sync=QLabel("Sync offset")
+        lbl_sync.setStyleSheet(f"color:{C['text2']};font-size:10pt;")
+        gsync.addRow(lbl_sync, sync_widget)
+
+        sync_hint=QLabel("Negative = audio arrives earlier (before video).  Positive = audio arrives later (after video).")
+        sync_hint.setWordWrap(True)
+        sync_hint.setStyleSheet(f"color:{C['subtext']};font-size:9pt;background:transparent;")
+        gsync.addRow("",sync_hint)
+        layout.addWidget(grp_sync)
+
         # Info note
         note=QLabel("Volume above 100% amplifies the signal (may clip).")
         note.setStyleSheet(f"color:{C['subtext']};font-size:9pt;background:transparent;")
@@ -1227,13 +1660,20 @@ class AudioDialog(BaseDialog):
             f"border-radius:4px;"
         )
 
-    def accept(self): self.close()
+    def accept(self):
+        self.cfg["audio_sample_rate"]=self.sr_combo.currentData()
+        self.cfg["audio_delay_ms"]=self.sync_spin.value()
+        self.close()
 
 class ImageDialog(BaseDialog):
-    def __init__(self,parent,vthread):
-        super().__init__(parent,"Image & Filters"); self.vthread=vthread
+    def __init__(self,parent,vthread,cfg=None):
+        super().__init__(parent,"Image & Filters"); self.vthread=vthread; self.cfg=cfg
         self.setMinimumWidth(520)
-        self.vals={"brightness":1.0,"contrast":1.0,"saturation":1.0}
+        self.vals={
+            "brightness": cfg.get("brightness",1.0) if cfg else 1.0,
+            "contrast":   cfg.get("contrast",1.0)   if cfg else 1.0,
+            "saturation": cfg.get("saturation",1.0)  if cfg else 1.0,
+        }
         layout=QVBoxLayout(self); layout.setSpacing(16); layout.setContentsMargins(20,20,20,20)
 
         hdr=QLabel("\u25c8  IMAGE & FILTERS")
@@ -1253,9 +1693,10 @@ class ImageDialog(BaseDialog):
         ]
         for key,label,lo,hi,tip in slider_defs:
             row=QHBoxLayout(); row.setSpacing(10)
-            sl=QSlider(Qt.Horizontal); sl.setRange(lo,hi); sl.setValue(100); sl.setToolTip(tip)
+            init_val=self.vals.get(key,1.0)
+            sl=QSlider(Qt.Horizontal); sl.setRange(lo,hi); sl.setValue(int(init_val*100)); sl.setToolTip(tip)
             spin=QDoubleSpinBox(); spin.setRange(lo/100.0,hi/100.0); spin.setDecimals(2)
-            spin.setSingleStep(0.05); spin.setValue(1.0); spin.setFixedWidth(80)
+            spin.setSingleStep(0.05); spin.setValue(init_val); spin.setFixedWidth(80)
             spin.setToolTip("Type a value directly (1.0 = neutral)")
             def _on_slider(v, k=key, sp=spin):
                 sp.blockSignals(True); sp.setValue(v/100.0); sp.blockSignals(False)
@@ -1283,6 +1724,11 @@ class ImageDialog(BaseDialog):
 
     def _apply(self):
         if self.vthread: self.vthread.set_image(self.vals["brightness"],self.vals["contrast"],self.vals["saturation"])
+        if self.cfg:
+            self.cfg["brightness"]=self.vals["brightness"]
+            self.cfg["contrast"]=self.vals["contrast"]
+            self.cfg["saturation"]=self.vals["saturation"]
+            save_config(self.cfg)
 
     def _reset(self):
         for key in self.sliders:
@@ -1364,8 +1810,9 @@ class RecordingDialog(BaseDialog):
         gfl.setContentsMargins(12,16,12,12)
 
         for attr,label,key,tip in [
-            ("rec_path","Recordings","recording_path","Folder where recordings and instant clips are saved"),
-            ("scr_path","Screenshots","screenshot_path","Folder where PNG screenshots are saved"),
+            ("rec_path","Recordings","recording_path","Folder where recordings are saved"),
+            ("scr_path","Screenshots","screenshot_path","Folder where screenshots are saved"),
+            ("clip_path_edit","Clips","clip_path","Folder where instant clips (F9) are saved"),
         ]:
             row=QHBoxLayout(); row.setSpacing(6)
             le=QLineEdit(cfg.get(key,"")); le.setToolTip(tip)
@@ -1382,6 +1829,31 @@ class RecordingDialog(BaseDialog):
             setattr(self,attr,le)
 
         layout.addWidget(grp)
+
+        # ── Screenshot Format ─────────────────────────────────────────────────
+        grp_sfmt=self._section("Screenshot Format"); gsfmt=QVBoxLayout(grp_sfmt); gsfmt.setSpacing(10)
+        gsfmt.setContentsMargins(12,16,12,12)
+        sfmt_row=QHBoxLayout(); sfmt_row.setSpacing(10); self.sfmt_bg=QButtonGroup()
+        cur_sfmt=cfg.get("screenshot_format","png")
+        for bid,(fmt,label_f) in enumerate([("png","PNG"),("jpeg","JPEG"),("webp","WebP")]):
+            rb=QRadioButton(label_f); rb.setChecked(fmt==cur_sfmt)
+            rb.setStyleSheet(f"font-size:10pt;background:transparent;")
+            self.sfmt_bg.addButton(rb,bid)
+            sfmt_row.addWidget(rb)
+        sfmt_row.addStretch()
+        gsfmt.addLayout(sfmt_row)
+        jpeg_row=QHBoxLayout(); jpeg_row.setSpacing(10)
+        jpeg_qlbl=QLabel("JPEG quality:"); jpeg_qlbl.setStyleSheet(f"color:{C['text2']};font-size:10pt;background:transparent;")
+        self.jpeg_quality_spin=QSpinBox(); self.jpeg_quality_spin.setRange(1,100)
+        self.jpeg_quality_spin.setValue(cfg.get("screenshot_jpeg_quality",92))
+        self.jpeg_quality_spin.setFixedWidth(80); self.jpeg_quality_spin.setSuffix("%")
+        self.jpeg_quality_spin.setToolTip("JPEG compression quality (higher = larger file, better quality)")
+        jpeg_row.addWidget(jpeg_qlbl); jpeg_row.addWidget(self.jpeg_quality_spin); jpeg_row.addStretch()
+        self._jpeg_qual_w=QWidget(); self._jpeg_qual_w.setLayout(jpeg_row)
+        self._jpeg_qual_w.setVisible(cur_sfmt=="jpeg")
+        gsfmt.addWidget(self._jpeg_qual_w)
+        self.sfmt_bg.idClicked.connect(lambda bid: self._jpeg_qual_w.setVisible(bid==1))
+        layout.addWidget(grp_sfmt)
 
         # ── Format & Buffer ───────────────────────────────────────────────────
         grp2=self._section("Format & Clip Buffer"); gl2=QVBoxLayout(grp2); gl2.setSpacing(12)
@@ -1424,12 +1896,100 @@ class RecordingDialog(BaseDialog):
         gl2.addLayout(clip_row)
 
         layout.addWidget(grp2)
+
+        # ── Audio Track ───────────────────────────────────────────────────────
+        grp_aud = self._section("Audio Track"); gaud = QVBoxLayout(grp_aud); gaud.setSpacing(10)
+        gaud.setContentsMargins(12,16,12,12)
+
+        # ffmpeg availability note
+        if not FFMPEG_PATH:
+            no_ff = QLabel(
+                "\u26a0  ffmpeg not found — audio will not be included in recordings.\n"
+                "Install ffmpeg and place it at  C:/ContentCapture_v2/bin/ffmpeg.exe  or add it to PATH."
+            )
+            no_ff.setWordWrap(True)
+            no_ff.setStyleSheet(
+                f"color:{C['warning']};font-size:9pt;background:transparent;"
+                f"border:1px solid {C['warning']}44;border-radius:6px;padding:6px 10px;"
+            )
+            gaud.addWidget(no_ff)
+
+        # Include audio checkbox
+        self.aud_include_chk = QCheckBox("Include audio in recordings")
+        self.aud_include_chk.setChecked(cfg.get("recording_include_audio", True) and bool(FFMPEG_PATH))
+        if not FFMPEG_PATH:
+            self.aud_include_chk.setEnabled(False)
+            self.aud_include_chk.setToolTip("Install ffmpeg to enable audio recording")
+        else:
+            self.aud_include_chk.setToolTip("Mux the captured audio stream into the output file via ffmpeg")
+        gaud.addWidget(self.aud_include_chk)
+
+        # Codec + bitrate row (enabled only when checkbox is on)
+        codec_row = QHBoxLayout(); codec_row.setSpacing(14)
+        codec_lbl = QLabel("Codec:"); codec_lbl.setStyleSheet(f"color:{C['text2']};font-size:10pt;background:transparent;")
+        codec_row.addWidget(codec_lbl)
+        self._aud_codec_bg = QButtonGroup()
+        cur_codec = cfg.get("recording_audio_codec","aac")
+        self._aud_rb_aac  = QRadioButton("AAC")
+        self._aud_rb_mp3  = QRadioButton("MP3")
+        self._aud_rb_pcm  = QRadioButton("PCM (lossless, large)")
+        for i,(rb,val) in enumerate([(self._aud_rb_aac,"aac"),(self._aud_rb_mp3,"mp3"),(self._aud_rb_pcm,"pcm")]):
+            rb.setChecked(val == cur_codec)
+            rb.setStyleSheet("font-size:10pt;background:transparent;")
+            self._aud_codec_bg.addButton(rb, i)
+            codec_row.addWidget(rb)
+        codec_row.addStretch()
+        gaud.addLayout(codec_row)
+
+        # Bitrate row
+        bitrate_row = QHBoxLayout(); bitrate_row.setSpacing(10)
+        bitrate_lbl = QLabel("Bitrate:"); bitrate_lbl.setStyleSheet(f"color:{C['text2']};font-size:10pt;background:transparent;")
+        self.aud_bitrate_spin = QSpinBox()
+        self.aud_bitrate_spin.setRange(64, 320)
+        self.aud_bitrate_spin.setSingleStep(64)
+        self.aud_bitrate_spin.setSuffix(" kbps")
+        self.aud_bitrate_spin.setFixedWidth(110)
+        cur_br = cfg.get("recording_audio_bitrate", 320)
+        # Snap to nearest valid value
+        for snap in [64, 128, 192, 320]:
+            if cur_br <= snap:
+                cur_br = snap; break
+        self.aud_bitrate_spin.setValue(cur_br)
+        self.aud_bitrate_spin.setToolTip("Audio bitrate for AAC/MP3 (ignored for PCM)")
+        bitrate_row.addWidget(bitrate_lbl); bitrate_row.addWidget(self.aud_bitrate_spin); bitrate_row.addStretch()
+        self._bitrate_widget = QWidget(); self._bitrate_widget.setLayout(bitrate_row)
+        gaud.addWidget(self._bitrate_widget)
+
+        # Wire up enable/disable logic
+        def _update_aud_controls():
+            enabled = self.aud_include_chk.isChecked() and bool(FFMPEG_PATH)
+            self._aud_rb_aac.setEnabled(enabled)
+            self._aud_rb_mp3.setEnabled(enabled)
+            self._aud_rb_pcm.setEnabled(enabled)
+            is_pcm = self._aud_rb_pcm.isChecked()
+            self.aud_bitrate_spin.setEnabled(enabled and not is_pcm)
+
+        self.aud_include_chk.stateChanged.connect(lambda _: _update_aud_controls())
+        self._aud_codec_bg.idClicked.connect(lambda _: _update_aud_controls())
+        _update_aud_controls()
+
+        layout.addWidget(grp_aud)
         layout.addLayout(self._buttons())
 
     def accept(self):
         self.cfg["recording_path"]=self.rec_path.text()
         self.cfg["screenshot_path"]=self.scr_path.text()
-        self.cfg["clip_duration"]=self.clip_spin.value(); super().accept()
+        self.cfg["clip_path"]=self.clip_path_edit.text()
+        self.cfg["clip_duration"]=self.clip_spin.value()
+        fmt_map={0:"png",1:"jpeg",2:"webp"}
+        self.cfg["screenshot_format"]=fmt_map.get(self.sfmt_bg.checkedId(),"png")
+        self.cfg["screenshot_jpeg_quality"]=self.jpeg_quality_spin.value()
+        # Audio track settings
+        self.cfg["recording_include_audio"] = self.aud_include_chk.isChecked()
+        codec_map = {0:"aac", 1:"mp3", 2:"pcm"}
+        self.cfg["recording_audio_codec"] = codec_map.get(self._aud_codec_bg.checkedId(), "aac")
+        self.cfg["recording_audio_bitrate"] = self.aud_bitrate_spin.value()
+        super().accept()
 
 class DeviceDialog(BaseDialog):
     def __init__(self,parent,cfg):
@@ -1487,17 +2047,42 @@ class DeviceDialog(BaseDialog):
         lbl_res=QLabel("Resolution / FPS:"); lbl_res.setStyleSheet(f"color:{C['text2']};font-size:10pt;")
         gfl.addRow(lbl_res, rfw)
 
-        # Audio device
+        # Audio input device
         self.aud_combo=QComboBox()
         self.aud_combo.setToolTip("Select the audio input device connected to the capture card")
-        for idx,name in find_audio_devices():
-            self.aud_combo.addItem(f"\U0001f50a  [{idx}] {name[:50]}",idx)
-            if idx==cfg.get("audio_input_index",3): self.aud_combo.setCurrentIndex(self.aud_combo.count()-1)
-        if self.aud_combo.count()==0: self.aud_combo.addItem("No audio devices found",0)
+        all_audio_devs=[]
+        try: all_audio_devs=list(enumerate(sd.query_devices()))
+        except Exception: pass
+        for idx,d in all_audio_devs:
+            if d["max_input_channels"]>0:
+                self.aud_combo.addItem(f"\U0001f50a  [{idx}] {d['name'][:50]}",idx)
+                if idx==cfg.get("audio_input_index",3): self.aud_combo.setCurrentIndex(self.aud_combo.count()-1)
+        if self.aud_combo.count()==0: self.aud_combo.addItem("No audio input devices found",0)
         lbl_aud=QLabel("Audio input:"); lbl_aud.setStyleSheet(f"color:{C['text2']};font-size:10pt;")
         gfl.addRow(lbl_aud, self.aud_combo)
 
+        # Audio output device
+        self.aud_out_combo=QComboBox()
+        self.aud_out_combo.setToolTip("Select the audio output / playback device (system default if not set)")
+        self.aud_out_combo.addItem("\U0001f508  System default",None)
+        saved_out=cfg.get("audio_output_index",None)
+        for idx,d in all_audio_devs:
+            if d["max_output_channels"]>0:
+                self.aud_out_combo.addItem(f"\U0001f508  [{idx}] {d['name'][:50]}",idx)
+                if idx==saved_out: self.aud_out_combo.setCurrentIndex(self.aud_out_combo.count()-1)
+        lbl_aud_out=QLabel("Audio output:"); lbl_aud_out.setStyleSheet(f"color:{C['text2']};font-size:10pt;")
+        gfl.addRow(lbl_aud_out, self.aud_out_combo)
+
         layout.addWidget(grp)
+
+        # ── Behaviour ─────────────────────────────────────────────────────────
+        grp_beh=self._section("Behaviour"); gbeh=QVBoxLayout(grp_beh); gbeh.setSpacing(8)
+        gbeh.setContentsMargins(12,16,12,12)
+        self.autostart_chk=QCheckBox("Auto-start stream on launch")
+        self.autostart_chk.setChecked(cfg.get("auto_start",True))
+        self.autostart_chk.setToolTip("Automatically start capturing when the app opens")
+        gbeh.addWidget(self.autostart_chk)
+        layout.addWidget(grp_beh)
 
         # Warning note
         note_bar=QFrame()
@@ -1517,8 +2102,292 @@ class DeviceDialog(BaseDialog):
     def accept(self):
         self.cfg["video_index"]=self.vid_combo.currentData()
         self.cfg["audio_input_index"]=self.aud_combo.currentData()
+        self.cfg["audio_output_index"]=self.aud_out_combo.currentData()
+        self.cfg["auto_start"]=self.autostart_chk.isChecked()
         if self.res_combo.currentData(): self.cfg["resolution"]=self.res_combo.currentData()
         if self.fps_combo.currentData(): self.cfg["fps"]=self.fps_combo.currentData()
+        super().accept()
+
+# ── HOTKEY DIALOG ─────────────────────────────────────────────────────────────
+# ── GLOBAL HOTKEY MANAGER ─────────────────────────────────────────────────────
+class GlobalHotkeyManager(QObject):
+    """Bridges the `keyboard` library's background-thread callbacks to Qt signals.
+
+    All public methods are safe to call from the Qt main thread.
+    Callbacks emitted by `keyboard` are forwarded via Signal so they always
+    arrive on the main thread regardless of which thread the hook fires on.
+    """
+    triggered = Signal(str)   # emits the action_key string, e.g. "save_clip"
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._registered = {}   # action_key -> hotkey string currently registered
+        self._enabled = False
+        try:
+            import keyboard as _kb
+            self._kb = _kb
+        except ImportError:
+            self._kb = None
+            print("[GlobalHotkey] 'keyboard' package not installed — global hotkeys unavailable")
+
+    def is_available(self) -> bool:
+        """Return True only when the `keyboard` library could be imported."""
+        return self._kb is not None
+
+    def register(self, action_key: str, key_str: str):
+        """Register (or replace) the global hotkey for *action_key*.
+
+        Safe to call multiple times; the old binding for the same action is
+        removed first.  No-ops if the manager is disabled or unavailable.
+        """
+        if not self._kb or not self._enabled:
+            return
+        # Remove any previous binding for this action
+        old = self._registered.get(action_key)
+        if old:
+            try:
+                self._kb.remove_hotkey(old)
+            except Exception:
+                pass
+        if not key_str:
+            return
+        try:
+            # The lambda captures action_key by value (a=action_key).
+            # Signal.emit() is thread-safe for Qt signals, so calling it from
+            # the keyboard hook thread is explicitly allowed.
+            self._kb.add_hotkey(
+                key_str,
+                lambda a=action_key: self.triggered.emit(a),
+                suppress=False,
+            )
+            self._registered[action_key] = key_str
+        except Exception as e:
+            print(f"[GlobalHotkey] Failed to register '{key_str}' for '{action_key}': {e}")
+
+    def unregister_all(self):
+        """Remove every registered global hotkey.  Safe to call when disabled."""
+        if not self._kb:
+            return
+        for key_str in list(self._registered.values()):
+            try:
+                self._kb.remove_hotkey(key_str)
+            except Exception:
+                pass
+        self._registered.clear()
+
+    def set_enabled(self, enabled: bool):
+        """Enable or disable global hotkeys.  Disabling also unregisters all hooks."""
+        self._enabled = enabled
+        if not enabled:
+            self.unregister_all()
+
+
+# ── HOTKEY DIALOG ─────────────────────────────────────────────────────────────
+class HotkeyDialog(BaseDialog):
+    # (action_key, display_name, default_key)
+    ACTIONS = [
+        ("toggle_stream",    "Toggle Stream",    "F5"),
+        ("save_clip",        "Save Clip",        "F9"),
+        ("toggle_recording", "Toggle Recording", "F10"),
+        ("toggle_fullscreen","Toggle Fullscreen","F11"),
+        ("screenshot",       "Screenshot",       "F12"),
+        ("toggle_mute",      "Toggle Mute",      "M"),
+        ("toggle_overlay",   "Toggle Overlay",   "P"),
+        ("reset_image",      "Reset Image",      "R"),
+        ("reset_zoom",       "Reset Zoom",       "Z"),
+        ("volume_up",        "Volume Up",        "="),
+        ("volume_down",      "Volume Down",      "-"),
+        ("exit_app",         "Exit App",         "Ctrl+Q"),
+    ]
+
+    def __init__(self, parent, cfg):
+        super().__init__(parent, "Hotkey Remapping")
+        self.cfg = cfg
+        self.setMinimumWidth(660)
+        self.setMinimumHeight(560)
+
+        # Grab GlobalHotkeyManager from parent window (may be None)
+        self._global_hk = getattr(parent, "_global_hk", None)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(16)
+        layout.setContentsMargins(20, 20, 20, 20)
+
+        hdr = QLabel("\u2328  HOTKEY REMAPPING")
+        hdr.setStyleSheet(
+            f"color:{C['accent']};font-size:13pt;font-weight:bold;"
+            f"letter-spacing:1.5px;background:transparent;"
+        )
+        layout.addWidget(hdr)
+        layout.addWidget(self._divider())
+
+        # ── Global Hotkeys group box ──────────────────────────────────────────
+        global_box = QGroupBox("Global Hotkeys")
+        global_box_layout = QVBoxLayout(global_box)
+        global_box_layout.setContentsMargins(12, 10, 12, 10)
+        global_box_layout.setSpacing(6)
+
+        self._global_master_cb = QCheckBox(
+            "Enable global hotkeys (work while app is not focused)"
+        )
+        self._global_master_cb.setChecked(cfg.get("global_hotkeys_enabled", False))
+        global_box_layout.addWidget(self._global_master_cb)
+
+        global_note = QLabel(
+            "Check the \u201cGlobal\u201d column below to make individual actions fire even when "
+            "another window (e.g. a game) is in the foreground."
+        )
+        global_note.setWordWrap(True)
+        global_note.setStyleSheet(
+            f"color:{C['text2']};font-size:9pt;background:transparent;"
+        )
+        global_box_layout.addWidget(global_note)
+
+        # If keyboard package is missing, disable the group and explain why
+        if self._global_hk is not None and not self._global_hk.is_available():
+            global_box.setEnabled(False)
+            global_box.setToolTip(
+                "Install the 'keyboard' package to enable global hotkeys  "
+                "(pip install keyboard)"
+            )
+
+        layout.addWidget(global_box)
+
+        note = QLabel(
+            "Click a key field and press the desired combination to remap it. "
+            "Click Reset to restore the factory default for that action."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color:{C['text2']};font-size:9pt;background:transparent;")
+        layout.addWidget(note)
+
+        # ── Hotkey table — 4 columns: Action | Key Binding | Global | Reset ──
+        self._table = QTableWidget(len(self.ACTIONS), 4, self)
+        self._table.setHorizontalHeaderLabels(["Action", "Key Binding", "Global", ""])
+        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self._table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Fixed)
+        self._table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Fixed)
+        self._table.setColumnWidth(2, 64)
+        self._table.setColumnWidth(3, 80)
+        self._table.verticalHeader().setVisible(False)
+        self._table.setSelectionMode(QAbstractItemView.NoSelection)
+        self._table.setFocusPolicy(Qt.NoFocus)
+        self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._table.setStyleSheet(
+            f"QTableWidget{{background:{C['panel2']};border:1px solid {C['border']};"
+            f"border-radius:8px;gridline-color:{C['border']};}}"
+            f"QTableWidget::item{{padding:4px 8px;}}"
+            f"QHeaderView::section{{background:{C['panel3']};color:{C['accent']};"
+            f"border:none;border-bottom:1px solid {C['border2']};"
+            f"padding:6px 8px;font-weight:bold;font-size:9pt;}}"
+        )
+
+        hotkeys = cfg.get("hotkeys", {})
+        global_actions = set(cfg.get("global_hotkey_actions", []))
+        global_enabled = cfg.get("global_hotkeys_enabled", False)
+        hk_available = self._global_hk is not None and self._global_hk.is_available()
+
+        self._edits = {}
+        self._global_cbs = {}   # action_key -> QCheckBox
+
+        for row, (key, name, default) in enumerate(self.ACTIONS):
+            current = hotkeys.get(key, default)
+
+            name_item = QTableWidgetItem(name)
+            name_item.setForeground(QColor(C["text"]))
+            self._table.setItem(row, 0, name_item)
+
+            edit = QKeySequenceEdit(QKeySequence(current), self)
+            edit.setStyleSheet(
+                f"QKeySequenceEdit{{background:{C['panel3']};color:{C['text']};"
+                f"border:1px solid {C['border2']};border-radius:6px;"
+                f"padding:4px 8px;font-size:10pt;}}"
+                f"QKeySequenceEdit:focus{{border-color:{C['accent']};}}"
+            )
+            self._table.setCellWidget(row, 1, edit)
+            self._edits[key] = edit
+
+            # "Global" checkbox — col 2
+            global_cb = QCheckBox()
+            global_cb.setChecked(key in global_actions)
+            global_cb.setEnabled(global_enabled and hk_available)
+            global_cb.setToolTip(
+                "Fire this action even when the app is not focused"
+                if hk_available
+                else "Install the 'keyboard' package to enable global hotkeys"
+            )
+            cb_container = QWidget()
+            cb_inner = QHBoxLayout(cb_container)
+            cb_inner.setContentsMargins(0, 0, 0, 0)
+            cb_inner.setAlignment(Qt.AlignCenter)
+            cb_inner.addWidget(global_cb)
+            self._table.setCellWidget(row, 2, cb_container)
+            self._global_cbs[key] = global_cb
+
+            reset_btn = QPushButton("Reset")
+            reset_btn.setFixedHeight(28)
+            reset_btn.setStyleSheet(
+                f"QPushButton{{background:{C['panel3']};color:{C['text2']};"
+                f"border:1px solid {C['border2']};border-radius:5px;"
+                f"padding:0 8px;font-size:9pt;}}"
+                f"QPushButton:hover{{background:{C['hover2']};color:{C['accent']};"
+                f"border-color:{C['accent']};}}"
+            )
+            reset_btn.clicked.connect(
+                lambda checked, d=default, e=edit: e.setKeySequence(QKeySequence(d))
+            )
+            btn_container = QWidget()
+            btn_inner = QHBoxLayout(btn_container)
+            btn_inner.setContentsMargins(4, 2, 4, 2)
+            btn_inner.addWidget(reset_btn)
+            self._table.setCellWidget(row, 3, btn_container)
+            self._table.setRowHeight(row, 38)
+
+        layout.addWidget(self._table)
+
+        # Wire master checkbox → enable/disable per-row global checkboxes
+        self._global_master_cb.toggled.connect(self._on_global_master_toggled)
+
+        reset_row = QHBoxLayout()
+        reset_all = QPushButton("\u21ba  Reset All to Defaults")
+        reset_all.setToolTip("Restore every action to its factory default key")
+        reset_all.clicked.connect(self._reset_all)
+        reset_row.addStretch()
+        reset_row.addWidget(reset_all)
+        layout.addLayout(reset_row)
+        layout.addLayout(self._buttons("Save"))
+
+    def _on_global_master_toggled(self, checked: bool):
+        """Enable or disable per-action Global checkboxes based on master state."""
+        hk_available = self._global_hk is not None and self._global_hk.is_available()
+        for cb in self._global_cbs.values():
+            cb.setEnabled(checked and hk_available)
+
+    def _reset_all(self):
+        for key, name, default in self.ACTIONS:
+            self._edits[key].setKeySequence(QKeySequence(default))
+
+    def accept(self):
+        hotkeys = self.cfg.setdefault("hotkeys", {})
+        for key, name, default in self.ACTIONS:
+            seq = self._edits[key].keySequence()
+            hotkeys[key] = seq.toString() if not seq.isEmpty() else default
+        self.cfg["hotkeys"] = hotkeys
+
+        # Persist global hotkey settings
+        self.cfg["global_hotkeys_enabled"] = self._global_master_cb.isChecked()
+        self.cfg["global_hotkey_actions"] = [
+            key for key, cb in self._global_cbs.items() if cb.isChecked()
+        ]
+
+        save_config(self.cfg)
+        parent = self.parent()
+        if parent and hasattr(parent, "_bind_shortcuts"):
+            parent._bind_shortcuts()
+        # Re-register global hotkeys to reflect any changes
+        if parent and hasattr(parent, "_apply_global_hotkeys"):
+            parent._apply_global_hotkeys()
         super().accept()
 
 # ── MAIN WINDOW ───────────────────────────────────────────────────────────────
@@ -1532,8 +2401,12 @@ class MainWindow(QMainWindow):
         self.recorder=VideoRecorder()
         self.clip_buf=ClipBuffer(self.cfg["clip_duration"],self.cfg["fps"])
         self.audio=None; self.vthread=None; self.running=False
+        self._audio_recorder=None
         self._raw_frame=None; self._frame_lock=threading.Lock(); self._sys_data={}
         self.fs_mode=False
+        # Global hotkey manager — bridges keyboard lib callbacks to the Qt thread
+        self._global_hk = GlobalHotkeyManager(self)
+        self._global_hk.triggered.connect(self._on_global_hotkey)
         self._build_ui(); self._build_menu(); self._bind_shortcuts()
         self.sys_stats=SystemStats()
         self.sys_stats.updated.connect(self._on_sys_stats)
@@ -1547,6 +2420,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(APP_NAME); self.setStyleSheet(STYLESHEET)
         if self.cfg.get("always_on_top"): self.setWindowFlags(self.windowFlags()|Qt.WindowStaysOnTopHint)
         if self.cfg.get("auto_start",True): QTimer.singleShot(1500,self.start_stream)
+        self._apply_global_hotkeys()
 
     # ── UI CONSTRUCTION ───────────────────────────────────────────────────────
     def _build_ui(self):
@@ -1890,6 +2764,8 @@ class MainWindow(QMainWindow):
         act(tm,"\u25b2  Volume Up  [=]",lambda:self._nudge_vol(0.1),"=")
         act(tm,"\u25bc  Volume Down  [-]",lambda:self._nudge_vol(-0.1),"-")
         tm.addSeparator()
+        act(tm,"\u2328  Hotkeys\u2026",self._open_hotkeys)
+        tm.addSeparator()
         self._aot_action=QAction("Always on Top",self,checkable=True)
         self._aot_action.setChecked(self.cfg.get("always_on_top",False))
         self._aot_action.triggered.connect(self._toggle_aot); tm.addAction(self._aot_action)
@@ -1938,14 +2814,83 @@ class MainWindow(QMainWindow):
         QApplication.clipboard().setPixmap(QPixmap.fromImage(img))
 
     def _bind_shortcuts(self):
-        for key,slot in [
-            ("F5",self.toggle_stream),("F9",self.save_clip),("F10",self.toggle_recording),
-            ("F11",self.toggle_fullscreen),("F12",self.take_screenshot),
-            ("M",self.toggle_mute),("P",self._toggle_overlay),("R",self._reset_image),
-            ("Z",self.video.reset_zoom),("=",lambda:self._nudge_vol(0.1)),
-            ("-",lambda:self._nudge_vol(-0.1)),
-            ("Escape",lambda:self.toggle_fullscreen() if self.fs_mode else None)]:
-            QShortcut(QKeySequence(key),self).activated.connect(slot)
+        """(Re-)register all keyboard shortcuts, reading from cfg["hotkeys"] with defaults."""
+        hk = self.cfg.get("hotkeys", {})
+        def k(action, default): return hk.get(action, default)
+
+        # Map each action key to its slot and config key
+        bindings = [
+            (k("toggle_stream",    "F5"),  self.toggle_stream),
+            (k("save_clip",        "F9"),  self.save_clip),
+            (k("toggle_recording", "F10"), self.toggle_recording),
+            (k("toggle_fullscreen","F11"), self.toggle_fullscreen),
+            (k("screenshot",       "F12"), self.take_screenshot),
+            (k("toggle_mute",      "M"),   self.toggle_mute),
+            (k("toggle_overlay",   "P"),   self._toggle_overlay),
+            (k("reset_image",      "R"),   self._reset_image),
+            (k("reset_zoom",       "Z"),   self.video.reset_zoom),
+            (k("volume_up",        "="),   lambda: self._nudge_vol(0.1)),
+            (k("volume_down",      "-"),   lambda: self._nudge_vol(-0.1)),
+            ("Escape", lambda: self.toggle_fullscreen() if self.fs_mode else None),
+        ]
+
+        # Delete old shortcuts so re-binding doesn't stack duplicates
+        if hasattr(self, "_shortcuts"):
+            for sc in self._shortcuts.values():
+                try: sc.setEnabled(False); sc.deleteLater()
+                except Exception: pass
+        self._shortcuts = {}
+
+        for key, slot in bindings:
+            if not key:
+                continue
+            sc = QShortcut(QKeySequence(key), self)
+            sc.activated.connect(slot)
+            self._shortcuts[key] = sc
+
+        # Exit App shortcut — maps to self.close
+        exit_key = k("exit_app", "Ctrl+Q")
+        sc_exit = QShortcut(QKeySequence(exit_key), self)
+        sc_exit.activated.connect(self.close)
+        self._shortcuts[exit_key] = sc_exit
+
+        # Re-apply global hotkeys whenever local shortcuts are rebuilt so the
+        # two systems stay in sync (e.g. after the hotkey dialog saves).
+        if hasattr(self, "_global_hk"):
+            self._apply_global_hotkeys()
+
+    # ── GLOBAL HOTKEY DISPATCH ────────────────────────────────────────────────
+    def _on_global_hotkey(self, action_key: str):
+        """Slot called (on the Qt main thread via Signal) when a global hotkey fires."""
+        actions = {
+            "toggle_stream":    self.toggle_stream,
+            "save_clip":        self.save_clip,
+            "toggle_recording": self.toggle_recording,
+            "toggle_fullscreen":self.toggle_fullscreen,
+            "screenshot":       self.take_screenshot,
+            "toggle_mute":      self.toggle_mute,
+            "toggle_overlay":   self._toggle_overlay,
+            "reset_image":      self._reset_image,
+            "reset_zoom":       self.video.reset_zoom,
+            "volume_up":        lambda: self._nudge_vol(0.1),
+            "volume_down":      lambda: self._nudge_vol(-0.1),
+        }
+        fn = actions.get(action_key)
+        if fn:
+            fn()
+
+    def _apply_global_hotkeys(self):
+        """Register (or clear) global hotkeys based on current config."""
+        if not self.cfg.get("global_hotkeys_enabled", False):
+            self._global_hk.unregister_all()
+            return
+        self._global_hk.set_enabled(True)
+        hk = self.cfg.get("hotkeys", {})
+        defaults = {key: dflt for key, _name, dflt in HotkeyDialog.ACTIONS}
+        for action_key in self.cfg.get("global_hotkey_actions", []):
+            key_str = hk.get(action_key, defaults.get(action_key, ""))
+            if key_str:
+                self._global_hk.register(action_key, key_str)
 
     # ── FULLSCREEN ────────────────────────────────────────────────────────────
     def toggle_fullscreen(self):
@@ -2028,15 +2973,23 @@ class MainWindow(QMainWindow):
 
     def start_stream(self):
         if self.running: return
-        in_idx=self.cfg.get("audio_input_index",3); out_idx=self.cfg.get("audio_output_index",9)
-        self.audio=AudioEngine(in_idx,out_idx)
+        in_idx=self.cfg.get("audio_input_index",3)
+        out_idx=self.cfg.get("audio_output_index",None)
+        sr=self.cfg.get("audio_sample_rate",48000)
+        self.audio=AudioEngine(in_idx,out_idx,sample_rate=sr)
         self.audio.set_volume(self.cfg.get("volume",1.0))
         if self.cfg.get("muted",False): self.audio.muted=True
-        self.audio.start()
+        self.audio.start(delay_ms=self.cfg.get("audio_delay_ms",0))
         self.vthread=VideoThread(self.cfg,self.perf)
         self.vthread.frame_ready.connect(self._on_frame)
         self.vthread.error.connect(self._on_video_error)
         self.vthread.start()
+        # Apply persisted image settings immediately
+        self.vthread.set_image(
+            self.cfg.get("brightness",1.0),
+            self.cfg.get("contrast",1.0),
+            self.cfg.get("saturation",1.0),
+        )
         self.running=True; self.perf.reset()
         # Update status pill and toolbar action
         self.status_pill.set_state("\u25cf LIVE", C["live"])
@@ -2138,11 +3091,34 @@ class MainWindow(QMainWindow):
         h,w=frame.shape[:2]; ts=datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         fmt=self.cfg.get("recording_format","mp4")
         path=os.path.join(self.cfg["recording_path"],f"rec_{ts}.{fmt}")
-        self.recorder.start(path,self.cfg.get("fps",60),w,h,fmt)
+
+        # ── Audio recording setup ─────────────────────────────────────────────
+        include_audio=self.cfg.get("recording_include_audio",True)
+        wav_path=None
+        if include_audio and FFMPEG_PATH:
+            wav_path=os.path.join(self.cfg["recording_path"],f"tmp_audio_{ts}.wav")
+            self._audio_recorder=AudioRecorder(self.cfg)
+            self._audio_recorder.start(wav_path)
+        else:
+            self._audio_recorder=None
+
+        # ── Start video recorder ──────────────────────────────────────────────
+        self.recorder.start(
+            path,
+            self.cfg.get("fps",60), w, h, fmt,
+            include_audio=include_audio and bool(FFMPEG_PATH),
+            wav_path=wav_path,
+            audio_codec=self.cfg.get("recording_audio_codec","aac"),
+            audio_bitrate=self.cfg.get("recording_audio_bitrate",320),
+        )
         self.rec_pill.set_state("\u23fa REC", C["record"]); self.rec_pill.show()
         self._rec_start_time=time.time(); self._rec_timer.start()
 
     def stop_recording(self):
+        # Stop audio first so it's fully flushed before ffmpeg muxes
+        if self._audio_recorder is not None:
+            self._audio_recorder.stop()
+            self._audio_recorder=None
         path=self.recorder.stop(); self.rec_pill.hide()
         self._rec_timer.stop(); self._rec_start_time=None; self._update_rec_duration()
         if path: QTimer.singleShot(100,lambda:QMessageBox.information(self,"Saved",f"Recording saved:\n{path}"))
@@ -2152,8 +3128,9 @@ class MainWindow(QMainWindow):
         with self._frame_lock: frame=self._raw_frame
         if frame is None: return
         h,w=frame.shape[:2]; ts=datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        path=os.path.join(self.cfg["recording_path"],f"clip_{ts}.mp4")
-        os.makedirs(self.cfg["recording_path"],exist_ok=True)
+        clip_dir=self.cfg.get("clip_path",self.cfg.get("recording_path",""))
+        path=os.path.join(clip_dir,f"clip_{ts}.mp4")
+        os.makedirs(clip_dir,exist_ok=True)
         self._notify("\U0001f4be Saving clip\u2026", C["clip"])
         self._clip_worker=ClipSaveWorker(self.clip_buf,path,w,h)
         self._clip_worker.finished.connect(self._on_clip_saved)
@@ -2169,9 +3146,17 @@ class MainWindow(QMainWindow):
         with self._frame_lock: frame=self._raw_frame
         if frame is None: QMessageBox.warning(self,"Screenshot","No frame \u2014 start stream first."); return
         ts=datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")[:-3]
-        path=os.path.join(self.cfg["screenshot_path"],f"capture_{ts}.png")
+        sfmt=self.cfg.get("screenshot_format","png")
+        ext={"png":"png","jpeg":"jpg","webp":"webp"}.get(sfmt,"png")
+        path=os.path.join(self.cfg["screenshot_path"],f"capture_{ts}.{ext}")
         os.makedirs(self.cfg["screenshot_path"],exist_ok=True)
-        ok=cv2.imwrite(path,frame)
+        if sfmt=="jpeg":
+            q=self.cfg.get("screenshot_jpeg_quality",92)
+            ok=cv2.imwrite(path,frame,[cv2.IMWRITE_JPEG_QUALITY,q])
+        elif sfmt=="webp":
+            ok=cv2.imwrite(path,frame,[cv2.IMWRITE_WEBP_QUALITY,90])
+        else:
+            ok=cv2.imwrite(path,frame)
         if not ok:
             QMessageBox.warning(self,"Screenshot",f"Failed to write screenshot:\n{path}"); return
         name=os.path.basename(path)
@@ -2203,7 +3188,7 @@ class MainWindow(QMainWindow):
         self.setWindowFlags(flags); self.show()
     def _open_folder(self,path): os.makedirs(path,exist_ok=True); os.startfile(path)
     def _open_audio(self): AudioDialog(self,self.cfg,self.audio).exec()
-    def _open_image(self): ImageDialog(self,self.vthread).exec()
+    def _open_image(self): ImageDialog(self,self.vthread,self.cfg).exec()
     def _open_upscale(self):
         dlg=UpscaleDialog(self,self.cfg)
         if dlg.exec(): self.cfg["upscale_mode"]=dlg.mode
@@ -2211,6 +3196,7 @@ class MainWindow(QMainWindow):
         dlg=RecordingDialog(self,self.cfg)
         if dlg.exec(): self.clip_buf.update(self.cfg["clip_duration"],self.cfg["fps"])
     def _open_devices(self): DeviceDialog(self,self.cfg).exec()
+    def _open_hotkeys(self): HotkeyDialog(self,self.cfg).exec()
     def _show_about(self):
         ram=get_available_ram_gb()
         QMessageBox.information(self,"About",
@@ -2220,6 +3206,9 @@ class MainWindow(QMainWindow):
             f"Config: {CONFIG_FILE}")
 
     def closeEvent(self,event):
+        # Unregister all keyboard library hooks first so the low-level hook is
+        # released before any other teardown runs.
+        self._global_hk.unregister_all()
         self.cfg["geometry"]=bytes(self.saveGeometry().toHex()).decode("ascii")
         save_config(self.cfg); self.stop_stream(); self.sys_stats.stop(); event.accept()
 
