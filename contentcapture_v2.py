@@ -543,13 +543,13 @@ def get_recommended_settings():
     print(f"[RAM] Detected {ram:.1f}GB total RAM")
     if ram < 12:
         print("[RAM] Low memory mode — 720p default, 10s clip buffer")
-        return {"clip_duration":10,"resolution":"1280x720"}
+        return {"clip_duration":10,"resolution":"1280x720","preview_fps_cap":24}
     elif ram < 20:
-        print("[RAM] Standard memory mode — 1080p, 20s clip buffer")
-        return {"clip_duration":20,"resolution":"1920x1080"}
+        print("[RAM] Standard memory mode — 1080p, 15s clip buffer")
+        return {"clip_duration":15,"resolution":"1920x1080","preview_fps_cap":30}
     else:
-        print("[RAM] High memory mode — 1080p, 30s clip buffer")
-        return {"clip_duration":30,"resolution":"1920x1080"}
+        print("[RAM] High memory mode — 1080p, 20s clip buffer")
+        return {"clip_duration":20,"resolution":"1920x1080","preview_fps_cap":30}
 
 DEFAULT_CONFIG = {
     "video_index":0,"audio_input_index":3,"audio_output_index":None,
@@ -558,7 +558,7 @@ DEFAULT_CONFIG = {
     "screenshot_path":os.path.join(os.environ.get("USERPROFILE","~"),"Pictures","ContentCapture"),
     "recording_path":os.path.join(os.environ.get("USERPROFILE","~"),"Videos","ContentCapture"),
     "clip_path":os.path.join(os.environ.get("USERPROFILE","~"),"Videos","ContentCapture","Clips"),
-    "clip_duration":30,"recording_format":"mp4",
+    "clip_duration":15,"recording_format":"mp4",           # FIX2: 15s default (was 30)
     "screenshot_format":"png","screenshot_jpeg_quality":92,
     "always_on_top":False,"auto_start":True,"geometry":None,"aspect_ratio_lock":True,
     "brightness":1.0,"contrast":1.0,"saturation":1.0,
@@ -576,6 +576,11 @@ DEFAULT_CONFIG = {
     "mic_enabled": False,   # BUG1: mic is OFF by default; must be explicitly enabled
     "mic_muted": False,
     "mic_volume": 1.0,
+    # ── Performance / RAM settings ──────────────────────────────────────────────
+    "clip_buffer_enabled": False,       # FIX3: OFF by default — saves constant RAM pressure
+    "clip_buffer_jpeg_quality": 85,     # FIX1: JPEG compress frames in buffer (20-60x RAM reduction)
+    "overlay": False,                   # FIX5: overlay off by default
+    "preview_fps_cap": 30,              # FIX6: 30fps preview cap (halves Qt repaint load)
 }
 
 def load_config():
@@ -739,35 +744,65 @@ class PerfTracker:
 
 # ── SYSTEM STATS ──────────────────────────────────────────────────────────────
 class SystemStats(QThread):
-    updated=Signal(dict)
+    """FIX4: Polls psutil + nvidia-smi only when the overlay is visible.
+    Use pause()/resume() to stop/start polling.  Starts paused by default
+    because the overlay is off by default (FIX5).
+    """
+    updated = Signal(dict)
+
     def __init__(self):
-        super().__init__(); self._stop=threading.Event()
+        super().__init__()
+        self._stop   = threading.Event()
+        self._active = threading.Event()   # FIX4: only poll when set
+        # FIX5: start paused (overlay off by default)
+        # _active is NOT set here — resume() must be called explicitly
+
+    def pause(self):
+        """Stop polling.  The run loop sleeps until resume() is called."""
+        self._active.clear()
+
+    def resume(self):
+        """Start (or restart) polling immediately."""
+        self._active.set()
+
     def run(self):
         while not self._stop.is_set():
-            d={}
+            # FIX4: block here (no CPU burn) if overlay is hidden
+            if not self._active.wait(timeout=1.0):
+                continue          # timed out — loop back and re-check _stop
+            d = {}
             try:
                 import psutil
-                d["cpu_pct"]=psutil.cpu_percent(interval=0.5)
-                vm=psutil.virtual_memory()
-                d["mem_used_mb"]=vm.used//(1024*1024)
-                d["mem_total_mb"]=vm.total//(1024*1024)
-                d["mem_pct"]=vm.percent
-            except Exception: pass
+                d["cpu_pct"] = psutil.cpu_percent(interval=0.5)
+                vm = psutil.virtual_memory()
+                d["mem_used_mb"]  = vm.used  // (1024 * 1024)
+                d["mem_total_mb"] = vm.total // (1024 * 1024)
+                d["mem_pct"]      = vm.percent
+            except Exception:
+                pass
             try:
-                r=subprocess.run(
-                    ["nvidia-smi","--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu",
+                r = subprocess.run(
+                    ["nvidia-smi",
+                     "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu",
                      "--format=csv,noheader,nounits"],
-                    capture_output=True,text=True,timeout=2,
+                    capture_output=True, text=True, timeout=2,
                     creationflags=subprocess.CREATE_NO_WINDOW)
-                if r.returncode==0 and r.stdout.strip():
-                    p=[x.strip() for x in r.stdout.strip().split(",")]
-                    if len(p)>=5:
-                        d["gpu_name"]=p[0]; d["gpu_util"]=float(p[1])
-                        d["gpu_mem_used"]=int(p[2]); d["gpu_mem_total"]=int(p[3])
-                        d["gpu_temp"]=int(p[4])
-            except Exception: pass
-            self.updated.emit(d); self._stop.wait(1.0)
-    def stop(self): self._stop.set()
+                if r.returncode == 0 and r.stdout.strip():
+                    p = [x.strip() for x in r.stdout.strip().split(",")]
+                    if len(p) >= 5:
+                        d["gpu_name"]     = p[0]
+                        d["gpu_util"]     = float(p[1])
+                        d["gpu_mem_used"] = int(p[2])
+                        d["gpu_mem_total"]= int(p[3])
+                        d["gpu_temp"]     = int(p[4])
+            except Exception:
+                pass
+            self.updated.emit(d)
+            self._stop.wait(1.0)
+
+    def stop(self):
+        self._active.set()   # unblock the wait so the thread can exit cleanly
+        self._stop.set()
 
 # ── VIDEO THREAD ──────────────────────────────────────────────────────────────
 class VideoThread(QThread):
@@ -1278,26 +1313,77 @@ class VideoRecorder:
 
 # ── CLIP BUFFER ───────────────────────────────────────────────────────────────
 class ClipBuffer:
-    def __init__(self,dur=30,fps=60):
-        self._buf=collections.deque(maxlen=dur*fps); self._fps=fps; self._lock=threading.Lock()
-    def push(self,f):
-        with self._lock: self._buf.append(f.copy())
-    def save(self,path,w,h):
-        with self._lock: frames=list(self._buf); fps=self._fps
-        if not frames: return None
-        parent=os.path.dirname(path)
+    """Rolling frame buffer for instant clip saving.
+
+    FIX1: Frames are JPEG-compressed on push so each stored frame is ~100-300KB
+    instead of ~6MB raw.  At 85 quality this is visually lossless and gives
+    a 20-60x RAM reduction.  Falls back to raw copy if encode fails.
+    """
+    def __init__(self, dur=15, fps=60, jpeg_quality=85):
+        self._buf = collections.deque(maxlen=max(1, dur * fps))
+        self._fps = fps
+        self._jpeg_quality = max(1, min(100, int(jpeg_quality)))
+        self._lock = threading.Lock()
+
+    def push(self, f):
+        """Encode frame to JPEG bytes and store.  Exception-safe."""
+        try:
+            ok, buf = cv2.imencode(
+                '.jpg', f,
+                [cv2.IMWRITE_JPEG_QUALITY, self._jpeg_quality]
+            )
+            if ok:
+                with self._lock:
+                    self._buf.append(buf)
+                return
+        except Exception as e:
+            print(f"[ClipBuffer] JPEG encode failed ({e}), storing raw frame")
+        # Fallback: store raw copy (still works, just uses more RAM)
+        with self._lock:
+            self._buf.append(f.copy())
+
+    def save(self, path, w, h):
+        with self._lock:
+            items = list(self._buf)
+            fps = self._fps
+        if not items:
+            return None
+        parent = os.path.dirname(path)
         if parent:
-            os.makedirs(parent,exist_ok=True)
-        wr=cv2.VideoWriter(path,cv2.VideoWriter_fourcc(*"mp4v"),fps,(w,h))
+            os.makedirs(parent, exist_ok=True)
+        wr = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
         if not wr.isOpened():
             print(f"[ClipBuffer] VideoWriter failed to open: {path}")
             return None
-        for f in frames: wr.write(cv2.resize(f,(w,h)))
-        wr.release(); return path
-    def update(self,dur,fps):
+        for item in items:
+            # item is either a JPEG-compressed numpy bytes array or a raw BGR frame
+            if item.ndim == 1:
+                # Compressed — decode back to BGR
+                try:
+                    frame = cv2.imdecode(item, cv2.IMREAD_COLOR)
+                    if frame is None:
+                        continue
+                except Exception as e:
+                    print(f"[ClipBuffer] JPEG decode failed: {e}")
+                    continue
+            else:
+                frame = item
+            wr.write(cv2.resize(frame, (w, h)))
+        wr.release()
+        return path
+
+    def update(self, dur, fps, jpeg_quality=None):
         with self._lock:
-            self._fps=fps
-            self._buf=collections.deque(self._buf,maxlen=dur*fps)
+            self._fps = fps
+            if jpeg_quality is not None:
+                self._jpeg_quality = max(1, min(100, int(jpeg_quality)))
+            self._buf = collections.deque(self._buf, maxlen=max(1, dur * fps))
+
+    def estimated_ram_mb(self, fps, dur, w=1920, h=1080):
+        """Rough RAM estimate for UI display.  Quality factor ≈ quality/100 * 0.05."""
+        raw_mb = w * h * 3 / (1024 * 1024)
+        quality_factor = self._jpeg_quality / 100.0 * 0.05
+        return int(fps * dur * raw_mb * quality_factor)
 
 class ClipSaveWorker(QThread):
     finished=Signal(str)
@@ -1320,8 +1406,25 @@ class VideoWidget(QLabel):
         self._sfps=self._sdrop=self._sren=self._sgpu=0.0
         self._target_fps=60; self._mode="none"; self._rec_active=False
         self.setMouseTracking(True)
+        # FIX6: frame-skip governor — only repaint at most preview_fps_cap times/sec
+        self._last_render = 0.0
+        self._render_interval = 1.0 / 30.0   # default 30fps preview
+
+    def set_render_fps(self, fps: int):
+        """FIX6: Set the maximum preview repaint rate (frames per second)."""
+        self._render_interval = 1.0 / max(1, int(fps))
 
     def set_frame(self,frame,perf,gpu_ms,rec,target_fps,mode,sys_data=None):
+        # FIX6: skip repaint if we rendered too recently
+        now = time.perf_counter()
+        if now - self._last_render < self._render_interval:
+            # Still update stored data so the next repaint shows fresh info
+            with self._lock:
+                self._perf=perf; self._sys=sys_data or {}
+                self._rec_active=rec; self._target_fps=target_fps; self._mode=mode
+            return
+        self._last_render = now
+
         h,w=frame.shape[:2]
         if self._zoom>1.0:
             cw=int(w/self._zoom); ch=int(h/self._zoom)
@@ -2195,17 +2298,122 @@ class RecordingDialog(BaseDialog):
         fmt_row.addStretch()
         gl2.addLayout(fmt_row)
 
-        # Clip buffer
+        gl2.addWidget(self._divider())
+
+        # ── FIX3: Enable Instant Clip Buffer checkbox ─────────────────────────
+        self.clip_buf_enabled_chk = QCheckBox("Enable Instant Clip Buffer")
+        self.clip_buf_enabled_chk.setChecked(cfg.get("clip_buffer_enabled", False))
+        self.clip_buf_enabled_chk.setStyleSheet("font-weight:bold;font-size:10pt;")
+        self.clip_buf_enabled_chk.setToolTip(
+            "Keeps recent footage in memory for instant clip saving (F9).\n"
+            "Disable to save RAM — JPEG compression is used to reduce memory usage."
+        )
+        gl2.addWidget(self.clip_buf_enabled_chk)
+
+        clip_note = QLabel(
+            "Keeps recent footage in RAM for instant clip saving.  "
+            "Uses JPEG compression — disable to save RAM."
+        )
+        clip_note.setWordWrap(True)
+        clip_note.setStyleSheet(f"color:{C['subtext']};font-size:9pt;background:transparent;")
+        gl2.addWidget(clip_note)
+
+        # Container for clip buffer sub-controls (greys out when disabled)
+        clip_controls = QWidget()
+        clip_controls_layout = QVBoxLayout(clip_controls)
+        clip_controls_layout.setContentsMargins(0, 4, 0, 0)
+        clip_controls_layout.setSpacing(10)
+
+        # Clip buffer duration + RAM estimate
         clip_row=QHBoxLayout(); clip_row.setSpacing(10)
-        clip_label=QLabel("Clip buffer duration:")
+        clip_label=QLabel("Buffer duration:")
         clip_label.setStyleSheet(f"color:{C['text2']};font-size:10pt;background:transparent;")
+        clip_label.setFixedWidth(110)
         self.clip_spin=QSpinBox(); self.clip_spin.setRange(5,120); self.clip_spin.setSuffix(" seconds")
-        self.clip_spin.setValue(cfg.get("clip_duration",30)); self.clip_spin.setFixedWidth(120)
+        self.clip_spin.setValue(cfg.get("clip_duration",15)); self.clip_spin.setFixedWidth(120)
         self.clip_spin.setToolTip("Seconds of footage kept in rolling buffer — press F9 to save as instant clip")
-        clip_row.addWidget(clip_label); clip_row.addWidget(self.clip_spin); clip_row.addStretch()
-        gl2.addLayout(clip_row)
+        self._clip_ram_lbl = QLabel()
+        self._clip_ram_lbl.setStyleSheet(f"color:{C['accent']};font-size:9pt;background:transparent;")
+        clip_row.addWidget(clip_label); clip_row.addWidget(self.clip_spin)
+        clip_row.addWidget(self._clip_ram_lbl); clip_row.addStretch()
+        clip_controls_layout.addLayout(clip_row)
+
+        # FIX1: JPEG quality slider
+        jpeg_q_row = QHBoxLayout(); jpeg_q_row.setSpacing(10)
+        jpeg_q_lbl = QLabel("Clip Buffer Quality:")
+        jpeg_q_lbl.setStyleSheet(f"color:{C['text2']};font-size:10pt;background:transparent;")
+        jpeg_q_lbl.setFixedWidth(130)
+        self.clip_jpeg_slider = QSlider(Qt.Horizontal)
+        self.clip_jpeg_slider.setRange(50, 100)
+        self.clip_jpeg_slider.setValue(cfg.get("clip_buffer_jpeg_quality", 85))
+        self.clip_jpeg_slider.setToolTip(
+            "JPEG quality for clip buffer frames (50-100).\n"
+            "85 is visually lossless.  Lower = smaller RAM, slightly lower quality."
+        )
+        self.clip_jpeg_spin = QSpinBox()
+        self.clip_jpeg_spin.setRange(50, 100)
+        self.clip_jpeg_spin.setSuffix("%")
+        self.clip_jpeg_spin.setFixedWidth(76)
+        self.clip_jpeg_spin.setValue(cfg.get("clip_buffer_jpeg_quality", 85))
+        self.clip_jpeg_spin.setToolTip("JPEG quality (85 = visually lossless, lower = less RAM)")
+
+        def _on_clip_jpeg_slider(v):
+            self.clip_jpeg_spin.blockSignals(True)
+            self.clip_jpeg_spin.setValue(v)
+            self.clip_jpeg_spin.blockSignals(False)
+            self._update_clip_ram_estimate()
+        def _on_clip_jpeg_spin(v):
+            self.clip_jpeg_slider.blockSignals(True)
+            self.clip_jpeg_slider.setValue(v)
+            self.clip_jpeg_slider.blockSignals(False)
+            self._update_clip_ram_estimate()
+        self.clip_jpeg_slider.valueChanged.connect(_on_clip_jpeg_slider)
+        self.clip_jpeg_spin.valueChanged.connect(_on_clip_jpeg_spin)
+
+        jpeg_q_row.addWidget(jpeg_q_lbl)
+        jpeg_q_row.addWidget(self.clip_jpeg_slider, 1)
+        jpeg_q_row.addWidget(self.clip_jpeg_spin)
+        clip_controls_layout.addLayout(jpeg_q_row)
+
+        self.clip_spin.valueChanged.connect(lambda _: self._update_clip_ram_estimate())
+        gl2.addWidget(clip_controls)
+
+        # Wire enable checkbox
+        def _on_clip_buf_toggled(checked):
+            clip_controls.setEnabled(checked)
+            cfg["clip_buffer_enabled"] = checked
+        self.clip_buf_enabled_chk.toggled.connect(_on_clip_buf_toggled)
+        clip_controls.setEnabled(cfg.get("clip_buffer_enabled", False))
+
+        # Initial RAM estimate
+        self._update_clip_ram_estimate()
 
         layout.addWidget(grp2)
+
+        # ── FIX6: Preview FPS Cap ─────────────────────────────────────────────
+        grp_prev = self._section("Preview Performance"); gp = QFormLayout(grp_prev)
+        gp.setSpacing(12); gp.setContentsMargins(12,16,12,12)
+        gp.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+        prev_fps_row = QHBoxLayout(); prev_fps_row.setSpacing(10)
+        self.preview_fps_spin = QSpinBox()
+        self.preview_fps_spin.setRange(10, 60)
+        self.preview_fps_spin.setValue(cfg.get("preview_fps_cap", 30))
+        self.preview_fps_spin.setSuffix(" fps")
+        self.preview_fps_spin.setFixedWidth(90)
+        self.preview_fps_spin.setToolTip(
+            "Maximum repaint rate for the preview window.\n"
+            "30fps is smooth and uses half the Qt rendering overhead of 60fps."
+        )
+        prev_fps_row.addWidget(self.preview_fps_spin); prev_fps_row.addStretch()
+        prev_fps_w = QWidget(); prev_fps_w.setLayout(prev_fps_row)
+        lbl_prev = QLabel("Preview FPS cap:")
+        lbl_prev.setStyleSheet(f"color:{C['text2']};font-size:10pt;")
+        gp.addRow(lbl_prev, prev_fps_w)
+        prev_hint = QLabel("30fps preview is smooth and halves Qt repaint overhead vs 60fps.")
+        prev_hint.setStyleSheet(f"color:{C['subtext']};font-size:9pt;background:transparent;")
+        gp.addRow("", prev_hint)
+        layout.addWidget(grp_prev)
 
         # ── Audio Track ───────────────────────────────────────────────────────
         grp_aud = self._section("Audio Track"); gaud = QVBoxLayout(grp_aud); gaud.setSpacing(10)
@@ -2269,6 +2477,25 @@ class RecordingDialog(BaseDialog):
         layout.addWidget(grp_aud)
         layout.addLayout(self._buttons())
 
+    def _update_clip_ram_estimate(self):
+        """FIX1: Show approximate RAM usage for the clip buffer at current settings."""
+        dur     = self.clip_spin.value()
+        quality = self.clip_jpeg_spin.value()
+        fps     = self.cfg.get("fps", 60)
+        # Rough estimate: raw 1080p frame = 6MB, JPEG at quality Q ≈ Q/100 * 5% of raw
+        raw_mb  = 1920 * 1080 * 3 / (1024 * 1024)
+        quality_factor = quality / 100.0 * 0.05
+        est_mb  = int(fps * dur * raw_mb * quality_factor)
+        # Clamp for display sanity
+        if est_mb < 1:
+            est_mb = 1
+        self._clip_ram_lbl.setText(f"≈ {est_mb} MB RAM")
+        tip = (
+            f"At {fps}fps × {dur}s × JPEG {quality}% quality ≈ {est_mb}MB\n"
+            f"(raw uncompressed would be {int(fps * dur * raw_mb / 1024)}GB)"
+        )
+        self._clip_ram_lbl.setToolTip(tip)
+
     def accept(self):
         self.cfg["recording_path"]=self.rec_path.text()
         self.cfg["screenshot_path"]=self.scr_path.text()
@@ -2277,6 +2504,11 @@ class RecordingDialog(BaseDialog):
         fmt_map={0:"png",1:"jpeg",2:"webp"}
         self.cfg["screenshot_format"]=fmt_map.get(self.sfmt_bg.checkedId(),"png")
         self.cfg["screenshot_jpeg_quality"]=self.jpeg_quality_spin.value()
+        # FIX1/3: Clip buffer settings
+        self.cfg["clip_buffer_enabled"]      = self.clip_buf_enabled_chk.isChecked()
+        self.cfg["clip_buffer_jpeg_quality"] = self.clip_jpeg_spin.value()
+        # FIX6: Preview FPS cap
+        self.cfg["preview_fps_cap"] = self.preview_fps_spin.value()
         # Audio track settings
         self.cfg["recording_include_audio"] = self.aud_include_chk.isChecked()
         codec_map = {0:"aac", 1:"mp3", 2:"pcm"}
@@ -2736,7 +2968,12 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.cfg=load_config(); self.perf=PerfTracker()
         self.recorder=VideoRecorder()
-        self.clip_buf=ClipBuffer(self.cfg["clip_duration"],self.cfg["fps"])
+        # FIX1/2/3: ClipBuffer with JPEG compression; 15s default; off by default
+        self.clip_buf=ClipBuffer(
+            self.cfg.get("clip_duration", 15),
+            self.cfg.get("fps", 60),
+            jpeg_quality=self.cfg.get("clip_buffer_jpeg_quality", 85),
+        )
         self.audio=None; self.vthread=None; self.running=False
         self._raw_frame=None; self._frame_lock=threading.Lock(); self._sys_data={}
         self.mic=MicEngine(self.cfg)
@@ -2745,9 +2982,14 @@ class MainWindow(QMainWindow):
         self._global_hk = GlobalHotkeyManager(self)
         self._global_hk.triggered.connect(self._on_global_hotkey)
         self._build_ui(); self._build_menu(); self._bind_shortcuts()
+        # FIX3: set initial clip button state
+        self._update_clip_action()
+        # FIX6: apply preview FPS cap to VideoWidget
+        self.video.set_render_fps(self.cfg.get("preview_fps_cap", 30))
+        # FIX4/5: SystemStats starts paused — only poll when overlay is visible
         self.sys_stats=SystemStats()
         self.sys_stats.updated.connect(self._on_sys_stats)
-        self.sys_stats.start()
+        self.sys_stats.start()   # thread starts but stays paused (overlay is off)
         if self.cfg.get("geometry"):
             try:
                 from PySide6.QtCore import QByteArray
@@ -2758,6 +3000,22 @@ class MainWindow(QMainWindow):
         if self.cfg.get("always_on_top"): self.setWindowFlags(self.windowFlags()|Qt.WindowStaysOnTopHint)
         if self.cfg.get("auto_start",True): QTimer.singleShot(1500,self.start_stream)
         self._apply_global_hotkeys()
+
+    def _update_clip_action(self):
+        """FIX3: Grey out / tooltip the CLIP toolbar button based on clip_buffer_enabled."""
+        enabled = self.cfg.get("clip_buffer_enabled", False)
+        dur = self.cfg.get("clip_duration", 15)
+        if enabled:
+            self._clip_action.setEnabled(True)
+            self._clip_action.setToolTip(
+                f"Save last {dur}s as instant clip  [F9]"
+            )
+        else:
+            self._clip_action.setEnabled(False)
+            self._clip_action.setToolTip(
+                "Enable clip buffer in Recording Settings first\n"
+                "(Tools \u2192 Recording Settings\u2026 \u2192 Clip Buffer section)"
+            )
 
     # ── UI CONSTRUCTION ───────────────────────────────────────────────────────
     def _build_ui(self):
@@ -2829,7 +3087,7 @@ class MainWindow(QMainWindow):
                                     "Start / stop recording to file  [F10]")
         self.toolbar.addAction(self._rec_action)
         self._clip_action=self._tact("\U0001f4be  CLIP", self.save_clip,
-                                     f"Save last {self.cfg.get('clip_duration',30)}s as instant clip  [F9]")
+                                     f"Save last {self.cfg.get('clip_duration',15)}s as instant clip  [F9]")
         self.toolbar.addAction(self._clip_action)
         self._shot_action=self._tact("\U0001f4f7  SHOT", self.take_screenshot,
                                      "Capture a PNG screenshot  [F12]")
@@ -3370,7 +3628,9 @@ class MainWindow(QMainWindow):
     def _on_frame(self,frame):
         if not self.running: return
         with self._frame_lock: self._raw_frame=frame.copy()
-        self.clip_buf.push(frame)
+        # FIX3: only push to ClipBuffer when it is explicitly enabled
+        if self.cfg.get("clip_buffer_enabled", False):
+            self.clip_buf.push(frame)
         if self.recorder.recording: self.recorder.write_video(frame)
         snap=self.perf.snapshot()
         self.video.set_frame(frame,snap,0.0,self.recorder.recording,
@@ -3495,6 +3755,15 @@ class MainWindow(QMainWindow):
 
     def save_clip(self):
         if not self.running: QMessageBox.warning(self,"Clip","Start stream first."); return
+        # FIX3: inform user if clip buffer is off
+        if not self.cfg.get("clip_buffer_enabled", False):
+            QMessageBox.information(
+                self, "Clip Buffer Disabled",
+                "Clip buffer is disabled — enable it in Recording Settings\n"
+                "(Tools \u2192 Recording Settings\u2026 \u2192 Clip Buffer section).\n\n"
+                "The buffer uses JPEG-compressed RAM to store recent footage."
+            )
+            return
         with self._frame_lock: frame=self._raw_frame
         if frame is None: return
         h,w=frame.shape[:2]; ts=datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -3547,6 +3816,12 @@ class MainWindow(QMainWindow):
     def _toggle_overlay(self):
         on=self.video.toggle_overlay()
         self._overlay_action.setChecked(on)
+        # FIX4: only poll system stats when the overlay is actually visible
+        if on:
+            self.sys_stats.resume()
+        else:
+            self.sys_stats.pause()
+            self._sys_data = {}   # clear stale data so HUD shows nothing when re-enabled
     def _toggle_ar_lock(self): self.video._ar_lock=self._ar_action.isChecked(); self.cfg["aspect_ratio_lock"]=self.video._ar_lock
     def _set_resolution(self,val): self.cfg["resolution"]=val; [a.setChecked(v==val) for v,a in self._res_actions.items()]
     def _set_fps(self,fps): self.cfg["fps"]=fps; [a.setChecked(f==fps) for f,a in self._fps_actions.items()]
@@ -3564,7 +3839,16 @@ class MainWindow(QMainWindow):
         if dlg.exec(): self.cfg["upscale_mode"]=dlg.mode
     def _open_recording(self):
         dlg=RecordingDialog(self,self.cfg)
-        if dlg.exec(): self.clip_buf.update(self.cfg["clip_duration"],self.cfg["fps"])
+        if dlg.exec():
+            self.clip_buf.update(
+                self.cfg.get("clip_duration", 15),
+                self.cfg.get("fps", 60),
+                jpeg_quality=self.cfg.get("clip_buffer_jpeg_quality", 85),
+            )
+            # FIX6: apply updated preview FPS cap
+            self.video.set_render_fps(self.cfg.get("preview_fps_cap", 30))
+            # FIX3: refresh clip button state
+            self._update_clip_action()
     def _open_devices(self): DeviceDialog(self,self.cfg).exec()
     def _open_hotkeys(self): HotkeyDialog(self,self.cfg).exec()
     def _show_about(self):
