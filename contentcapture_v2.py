@@ -757,7 +757,8 @@ class SystemStats(QThread):
                 r=subprocess.run(
                     ["nvidia-smi","--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu",
                      "--format=csv,noheader,nounits"],
-                    capture_output=True,text=True,timeout=2)
+                    capture_output=True,text=True,timeout=2,
+                    creationflags=subprocess.CREATE_NO_WINDOW)
                 if r.returncode==0 and r.stdout.strip():
                     p=[x.strip() for x in r.stdout.strip().split(",")]
                     if len(p)>=5:
