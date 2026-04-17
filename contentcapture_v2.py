@@ -4,9 +4,9 @@ Native Windows — PySide6 + MSMF + WASAPI
 No WSL, no usbipd, no PulseAudio.
 """
 import sys, os, cv2, time, threading, collections, json, subprocess
-import queue, wave
 import numpy as np
 import sounddevice as sd
+import av
 from datetime import datetime
 
 from PySide6.QtWidgets import (
@@ -551,29 +551,6 @@ def get_recommended_settings():
         print("[RAM] High memory mode — 1080p, 30s clip buffer")
         return {"clip_duration":30,"resolution":"1920x1080"}
 
-# ── FFMPEG DETECTION ─────────────────────────────────────────────────────────
-def _find_ffmpeg():
-    """Return path to ffmpeg executable, or None if not found."""
-    bundled = r"C:/ContentCapture_v2/bin/ffmpeg.exe"
-    if os.path.isfile(bundled):
-        print(f"[FFmpeg] Found bundled: {bundled}")
-        return bundled
-    # Fall back to PATH
-    try:
-        result = subprocess.run(
-            ["ffmpeg", "-version"],
-            capture_output=True, text=True, timeout=5
-        )
-        if result.returncode == 0:
-            print("[FFmpeg] Found on PATH")
-            return "ffmpeg"
-    except Exception:
-        pass
-    print("[FFmpeg] Not found — audio will not be included in recordings")
-    return None
-
-FFMPEG_PATH = _find_ffmpeg()
-
 DEFAULT_CONFIG = {
     "video_index":0,"audio_input_index":3,"audio_output_index":None,
     "resolution":"1920x1080","fps":60,"volume":1.0,"muted":False,
@@ -810,6 +787,13 @@ class AudioEngine:
         self._delay_ms=0
         self._delay_buf=collections.deque()
         self._samples_to_skip=0
+        # Recording hook — set by MainWindow.start_recording() / stop_recording()
+        self._recorder_ref=None
+
+    def set_recorder(self, recorder_or_none):
+        """Attach or detach a VideoRecorder so the audio callback can feed it.
+        Safe to call from the UI thread at any time."""
+        self._recorder_ref = recorder_or_none
 
     def set_delay(self, ms: int):
         """Set the AV sync offset in milliseconds.
@@ -835,6 +819,14 @@ class AudioEngine:
         engine = self
 
         def callback(indata, outdata, frames, time_info, status):
+            # ── Feed recorder first (always, regardless of mute/delay) ────────
+            rec = engine._recorder_ref
+            if rec is not None:
+                try:
+                    rec.write_audio(indata)
+                except Exception:
+                    pass
+
             # ── Volume / mute pre-process into a scratch buffer ───────────────
             if engine._audio_buf is None or engine._audio_buf.shape != outdata.shape:
                 engine._audio_buf = np.empty_like(outdata)
@@ -920,280 +912,132 @@ class AudioEngine:
             result=self.muted
         return result
 
-# ── AUDIO RECORDER ───────────────────────────────────────────────────────────
-class AudioRecorder:
-    """
-    Captures raw PCM float32 from a sounddevice InputStream and writes it to
-    a temporary WAV file (int16 PCM) for later muxing by VideoRecorder.
-
-    Usage:
-        rec = AudioRecorder(cfg)
-        rec.start("/tmp/audio_123.wav")
-        ...
-        rec.stop()   # flushes remaining audio and closes the file
-    """
-
-    def __init__(self, cfg):
-        self._cfg = cfg
-        self._stream = None
-        self._q: queue.Queue = queue.Queue()
-        self._thread = None
-        self._wav_path = None
-        self._wav_file = None
-        self._channels = 1
-        self._sample_rate = 48000
-        self._stop_event = threading.Event()
-        self._recording = False
-
-    # ── internal writer thread ────────────────────────────────────────────────
-    def _writer_loop(self):
-        """Drain the queue and write int16 PCM chunks to the WAV file."""
-        while not self._stop_event.is_set() or not self._q.empty():
-            try:
-                chunk = self._q.get(timeout=0.05)
-                self._write_chunk(chunk)
-            except queue.Empty:
-                continue
-        # Final flush — drain anything that arrived between stop_event.set() and here
-        while not self._q.empty():
-            try:
-                chunk = self._q.get_nowait()
-                self._write_chunk(chunk)
-            except queue.Empty:
-                break
-        if self._wav_file:
-            try:
-                self._wav_file.close()
-            except Exception:
-                pass
-            self._wav_file = None
-
-    def _write_chunk(self, data: np.ndarray):
-        """Convert float32 ndarray to int16 and append to WAV file."""
-        if self._wav_file is None:
-            return
-        try:
-            clipped = np.clip(data, -1.0, 1.0)
-            pcm16 = (clipped * 32767.0).astype(np.int16)
-            self._wav_file.writeframes(pcm16.tobytes())
-        except Exception as e:
-            print(f"[AudioRecorder] write error: {e}")
-
-    # ── sounddevice callback ──────────────────────────────────────────────────
-    def _sd_callback(self, indata, frames, time_info, status):
-        if status:
-            print(f"[AudioRecorder] sounddevice status: {status}")
-        if self._recording:
-            self._q.put(indata.copy())
-
-    # ── public API ───────────────────────────────────────────────────────────
-    def start(self, wav_path: str):
-        """Open the input stream and start writing PCM to wav_path."""
-        self._wav_path = wav_path
-        self._stop_event.clear()
-        self._recording = False
-
-        in_idx = self._cfg.get("audio_input_index", 3)
-        sr = self._cfg.get("audio_sample_rate", 48000)
-        self._sample_rate = sr
-
-        # Determine channel count from device info
-        try:
-            di = sd.query_devices(in_idx)
-            self._channels = min(2, int(di["max_input_channels"]))
-        except Exception:
-            self._channels = 1
-
-        # Open WAV file before the stream starts so the writer thread is ready
-        try:
-            os.makedirs(os.path.dirname(wav_path) or ".", exist_ok=True)
-            self._wav_file = wave.open(wav_path, "wb")
-            self._wav_file.setnchannels(self._channels)
-            self._wav_file.setsampwidth(2)           # 16-bit
-            self._wav_file.setframerate(sr)
-        except Exception as e:
-            print(f"[AudioRecorder] Could not open WAV file {wav_path}: {e}")
-            self._wav_file = None
-            return
-
-        # Start writer daemon thread
-        self._thread = threading.Thread(target=self._writer_loop, daemon=True, name="AudioRecorderWriter")
-        self._thread.start()
-
-        # Open sounddevice input stream
-        try:
-            self._stream = sd.InputStream(
-                device=in_idx,
-                samplerate=sr,
-                channels=self._channels,
-                dtype="float32",
-                blocksize=2048,
-                callback=self._sd_callback,
-            )
-            self._stream.start()
-            self._recording = True
-            print(f"[AudioRecorder] Started — device:{in_idx} ch:{self._channels} rate:{sr} -> {wav_path}")
-        except Exception as e:
-            print(f"[AudioRecorder] Failed to open input stream: {e}")
-            self._stop_event.set()
-            self._recording = False
-
-    def stop(self):
-        """Stop the stream, flush remaining audio, and close the WAV file."""
-        self._recording = False
-        if self._stream:
-            try:
-                self._stream.stop()
-                self._stream.close()
-            except Exception:
-                pass
-            self._stream = None
-        # Signal writer thread to finish flushing
-        self._stop_event.set()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=5.0)
-        self._thread = None
-        print(f"[AudioRecorder] Stopped — WAV: {self._wav_path}")
-
-    @property
-    def wav_path(self) -> str:
-        return self._wav_path or ""
-
-
-# ── VIDEO RECORDER ────────────────────────────────────────────────────────────
+# ── VIDEO RECORDER (PyAV) ─────────────────────────────────────────────────────
 class VideoRecorder:
     """
-    Records video frames to a file.
-
-    If FFMPEG_PATH is set and include_audio=True (with a valid wav_path),
-    frames are piped to an ffmpeg subprocess that muxes video + audio into a
-    single output file.  Otherwise, falls back to cv2.VideoWriter (silent).
+    Records video frames and audio samples directly to a container file
+    (MP4/MKV) using PyAV's bundled FFmpeg libraries.  No external binary needed.
     """
 
     def __init__(self):
-        # cv2 fallback
-        self.writer = None
-        # ffmpeg pipe mode
-        self._ffmpeg_proc = None
-        self._wav_path_to_cleanup = None
-        # shared state
         self.recording = False
-        self.path = None
+        self._container = None
+        self._v_stream = None
+        self._a_stream = None
         self._lock = threading.Lock()
-        self._use_ffmpeg = False
+        self._pts_v = 0
+        self._pts_a = 0
+        self._sample_rate = 48000
+        self._channels = 2
+        self._audio_buf = np.empty((0,), dtype=np.float32)
+        self.path = None
 
-    def start(self, path, fps, w, h, fmt="mp4",
-              include_audio=False, wav_path=None,
-              audio_codec="aac", audio_bitrate=320):
-        with self._lock:
-            parent = os.path.dirname(path)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
+    def start(self, path, w, h, fps, include_audio=True,
+              audio_input_index=None, sample_rate=48000,
+              audio_codec="aac", audio_bitrate=320,
+              video_quality=18):
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
 
-            self._use_ffmpeg = False
-            self._ffmpeg_proc = None
-            self._wav_path_to_cleanup = None
-            self.writer = None
+        self._sample_rate = sample_rate
+        self._channels = 2
+        self._pts_v = 0
+        self._pts_a = 0
+        self._audio_buf = np.empty((0,), dtype=np.float32)
 
-            # ── Try ffmpeg pipe mode ──────────────────────────────────────────
-            if FFMPEG_PATH and include_audio and wav_path and os.path.isfile(wav_path):
-                codec_map = {
-                    "aac":  ("aac",  f"{audio_bitrate}k"),
-                    "mp3":  ("libmp3lame", f"{audio_bitrate}k"),
-                    "pcm":  ("pcm_s16le", None),
-                }
-                acodec, abitrate = codec_map.get(audio_codec, ("aac", "320k"))
+        try:
+            self._container = av.open(path, mode='w')
+        except Exception as e:
+            print(f"[Recorder] Failed to open container: {e}")
+            return
 
-                cmd = [
-                    FFMPEG_PATH, "-y",
-                    # video from stdin pipe
-                    "-f", "rawvideo",
-                    "-pix_fmt", "bgr24",
-                    "-s", f"{w}x{h}",
-                    "-r", str(fps),
-                    "-i", "pipe:0",
-                    # audio from temp WAV
-                    "-i", wav_path,
-                    # video codec
-                    "-c:v", "libx264",
-                    "-crf", "18",
-                    "-preset", "fast",
-                    # audio codec
-                    "-c:a", acodec,
-                ]
-                if abitrate:
-                    cmd += ["-b:a", abitrate]
-                cmd += ["-shortest", path]
+        # Video stream — H.264
+        self._v_stream = self._container.add_stream('libx264', rate=fps)
+        self._v_stream.width = w
+        self._v_stream.height = h
+        self._v_stream.pix_fmt = 'yuv420p'
+        self._v_stream.options = {'crf': str(video_quality), 'preset': 'fast'}
 
-                try:
-                    self._ffmpeg_proc = subprocess.Popen(
-                        cmd,
-                        stdin=subprocess.PIPE,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                    self._use_ffmpeg = True
-                    self._wav_path_to_cleanup = wav_path
-                    self.recording = True
-                    self.path = path
-                    print(f"[Recorder] ffmpeg pipe mode — {w}x{h}@{fps} + audio ({acodec}) -> {path}")
-                    return
-                except Exception as e:
-                    print(f"[Recorder] ffmpeg launch failed ({e}), falling back to cv2.VideoWriter")
-                    self._ffmpeg_proc = None
+        # Audio stream (only if requested)
+        if include_audio:
+            codec_name = {'aac': 'aac', 'mp3': 'libmp3lame', 'pcm': 'pcm_s16le'}.get(audio_codec, 'aac')
+            self._a_stream = self._container.add_stream(codec_name, rate=sample_rate)
+            self._a_stream.channels = self._channels
+            self._a_stream.layout = 'stereo'
+            if audio_codec != 'pcm':
+                self._a_stream.bit_rate = audio_bitrate * 1000
+        else:
+            self._a_stream = None
 
-            # ── cv2 fallback (silent) ─────────────────────────────────────────
-            fourcc = cv2.VideoWriter_fourcc(*("mp4v" if fmt == "mp4" else "XVID"))
-            self.writer = cv2.VideoWriter(path, fourcc, fps, (w, h))
-            if not self.writer.isOpened():
-                print(f"[Recorder] VideoWriter failed to open: {path}")
-                self.writer = None
-                return
-            self.recording = True
-            self.path = path
-            if include_audio and not FFMPEG_PATH:
-                print("[Recorder] ffmpeg not found — recording without audio")
+        self.recording = True
+        self.path = path
+        print(f"[Recorder] PyAV — {w}x{h}@{fps} include_audio={include_audio} -> {path}")
 
-    def write(self, frame):
-        with self._lock:
-            if not self.recording:
-                return
-            if self._use_ffmpeg and self._ffmpeg_proc:
-                try:
-                    self._ffmpeg_proc.stdin.write(frame.tobytes())
-                except Exception as e:
-                    print(f"[Recorder] ffmpeg write error: {e}")
-            elif self.writer:
-                self.writer.write(frame)
+    def write_video(self, frame_bgr):
+        """Write a BGR numpy frame."""
+        if not self.recording or self._container is None:
+            return
+        try:
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            av_frame = av.VideoFrame.from_ndarray(frame_rgb, format='rgb24')
+            av_frame.pts = self._pts_v
+            av_frame.time_base = self._v_stream.time_base
+            self._pts_v += 1
+            with self._lock:
+                for pkt in self._v_stream.encode(av_frame):
+                    self._container.mux(pkt)
+        except Exception as e:
+            print(f"[Recorder] Video write error: {e}")
+
+    def write_audio(self, indata_float32):
+        """Write a chunk of float32 stereo audio (shape: [N, channels])."""
+        if not self.recording or self._a_stream is None or self._container is None:
+            return
+        try:
+            chunk = indata_float32.astype(np.float32)
+            self._audio_buf = np.concatenate([self._audio_buf, chunk.flatten()])
+            frame_size = self._a_stream.codec_context.frame_size or 1024
+            samples_needed = frame_size * self._channels
+            while len(self._audio_buf) >= samples_needed:
+                block = self._audio_buf[:samples_needed]
+                self._audio_buf = self._audio_buf[samples_needed:]
+                block_2d = block.reshape(-1, self._channels)
+                av_frame = av.AudioFrame.from_ndarray(
+                    block_2d.T.copy(), format='fltp', layout='stereo'
+                )
+                av_frame.sample_rate = self._sample_rate
+                av_frame.pts = self._pts_a
+                self._pts_a += frame_size
+                with self._lock:
+                    for pkt in self._a_stream.encode(av_frame):
+                        self._container.mux(pkt)
+        except Exception as e:
+            print(f"[Recorder] Audio write error: {e}")
 
     def stop(self):
-        with self._lock:
-            self.recording = False
-            path = self.path
+        if not self.recording:
+            return
+        self.recording = False
+        path = self.path
+        try:
+            with self._lock:
+                if self._v_stream:
+                    for pkt in self._v_stream.encode():
+                        self._container.mux(pkt)
+                if self._a_stream:
+                    for pkt in self._a_stream.encode():
+                        self._container.mux(pkt)
+                if self._container:
+                    self._container.close()
+        except Exception as e:
+            print(f"[Recorder] Stop error: {e}")
+        finally:
+            self._container = None
+            self._v_stream = None
+            self._a_stream = None
             self.path = None
-
-            if self._use_ffmpeg and self._ffmpeg_proc:
-                try:
-                    self._ffmpeg_proc.stdin.close()
-                    self._ffmpeg_proc.wait(timeout=30)
-                except Exception as e:
-                    print(f"[Recorder] ffmpeg finish error: {e}")
-                    try: self._ffmpeg_proc.kill()
-                    except Exception: pass
-                self._ffmpeg_proc = None
-                self._use_ffmpeg = False
-                # Clean up temp WAV
-                if self._wav_path_to_cleanup:
-                    try:
-                        os.remove(self._wav_path_to_cleanup)
-                    except Exception:
-                        pass
-                    self._wav_path_to_cleanup = None
-            elif self.writer:
-                self.writer.release()
-                self.writer = None
-
-            return path
+        return path
 
 # ── CLIP BUFFER ───────────────────────────────────────────────────────────────
 class ClipBuffer:
@@ -1901,27 +1745,10 @@ class RecordingDialog(BaseDialog):
         grp_aud = self._section("Audio Track"); gaud = QVBoxLayout(grp_aud); gaud.setSpacing(10)
         gaud.setContentsMargins(12,16,12,12)
 
-        # ffmpeg availability note
-        if not FFMPEG_PATH:
-            no_ff = QLabel(
-                "\u26a0  ffmpeg not found — audio will not be included in recordings.\n"
-                "Install ffmpeg and place it at  C:/ContentCapture_v2/bin/ffmpeg.exe  or add it to PATH."
-            )
-            no_ff.setWordWrap(True)
-            no_ff.setStyleSheet(
-                f"color:{C['warning']};font-size:9pt;background:transparent;"
-                f"border:1px solid {C['warning']}44;border-radius:6px;padding:6px 10px;"
-            )
-            gaud.addWidget(no_ff)
-
         # Include audio checkbox
         self.aud_include_chk = QCheckBox("Include audio in recordings")
-        self.aud_include_chk.setChecked(cfg.get("recording_include_audio", True) and bool(FFMPEG_PATH))
-        if not FFMPEG_PATH:
-            self.aud_include_chk.setEnabled(False)
-            self.aud_include_chk.setToolTip("Install ffmpeg to enable audio recording")
-        else:
-            self.aud_include_chk.setToolTip("Mux the captured audio stream into the output file via ffmpeg")
+        self.aud_include_chk.setChecked(cfg.get("recording_include_audio", True))
+        self.aud_include_chk.setToolTip("Mux the captured audio stream into the output file (built-in encoder)")
         gaud.addWidget(self.aud_include_chk)
 
         # Codec + bitrate row (enabled only when checkbox is on)
@@ -1962,7 +1789,7 @@ class RecordingDialog(BaseDialog):
 
         # Wire up enable/disable logic
         def _update_aud_controls():
-            enabled = self.aud_include_chk.isChecked() and bool(FFMPEG_PATH)
+            enabled = self.aud_include_chk.isChecked()
             self._aud_rb_aac.setEnabled(enabled)
             self._aud_rb_mp3.setEnabled(enabled)
             self._aud_rb_pcm.setEnabled(enabled)
@@ -2401,7 +2228,6 @@ class MainWindow(QMainWindow):
         self.recorder=VideoRecorder()
         self.clip_buf=ClipBuffer(self.cfg["clip_duration"],self.cfg["fps"])
         self.audio=None; self.vthread=None; self.running=False
-        self._audio_recorder=None
         self._raw_frame=None; self._frame_lock=threading.Lock(); self._sys_data={}
         self.fs_mode=False
         # Global hotkey manager — bridges keyboard lib callbacks to the Qt thread
@@ -3026,7 +2852,7 @@ class MainWindow(QMainWindow):
         if not self.running: return
         with self._frame_lock: self._raw_frame=frame.copy()
         self.clip_buf.push(frame)
-        if self.recorder.recording: self.recorder.write(frame)
+        if self.recorder.recording: self.recorder.write_video(frame)
         snap=self.perf.snapshot()
         self.video.set_frame(frame,snap,0.0,self.recorder.recording,
                              self.cfg.get("fps",60),self.cfg.get("upscale_mode","none"),self._sys_data)
@@ -3092,33 +2918,30 @@ class MainWindow(QMainWindow):
         fmt=self.cfg.get("recording_format","mp4")
         path=os.path.join(self.cfg["recording_path"],f"rec_{ts}.{fmt}")
 
-        # ── Audio recording setup ─────────────────────────────────────────────
         include_audio=self.cfg.get("recording_include_audio",True)
-        wav_path=None
-        if include_audio and FFMPEG_PATH:
-            wav_path=os.path.join(self.cfg["recording_path"],f"tmp_audio_{ts}.wav")
-            self._audio_recorder=AudioRecorder(self.cfg)
-            self._audio_recorder.start(wav_path)
-        else:
-            self._audio_recorder=None
 
-        # ── Start video recorder ──────────────────────────────────────────────
+        # ── Start PyAV recorder ───────────────────────────────────────────────
         self.recorder.start(
-            path,
-            self.cfg.get("fps",60), w, h, fmt,
-            include_audio=include_audio and bool(FFMPEG_PATH),
-            wav_path=wav_path,
+            path, w, h,
+            fps=self.cfg.get("fps",60),
+            include_audio=include_audio,
+            audio_input_index=self.cfg.get("audio_input_index"),
+            sample_rate=self.cfg.get("audio_sample_rate",48000),
             audio_codec=self.cfg.get("recording_audio_codec","aac"),
             audio_bitrate=self.cfg.get("recording_audio_bitrate",320),
         )
+
+        # Attach recorder to AudioEngine so the sounddevice callback feeds audio
+        if include_audio and self.audio is not None:
+            self.audio.set_recorder(self.recorder)
+
         self.rec_pill.set_state("\u23fa REC", C["record"]); self.rec_pill.show()
         self._rec_start_time=time.time(); self._rec_timer.start()
 
     def stop_recording(self):
-        # Stop audio first so it's fully flushed before ffmpeg muxes
-        if self._audio_recorder is not None:
-            self._audio_recorder.stop()
-            self._audio_recorder=None
+        # Detach recorder from AudioEngine before stopping so no more audio is written
+        if self.audio is not None:
+            self.audio.set_recorder(None)
         path=self.recorder.stop(); self.rec_pill.hide()
         self._rec_timer.stop(); self._rec_start_time=None; self._update_rec_duration()
         if path: QTimer.singleShot(100,lambda:QMessageBox.information(self,"Saved",f"Recording saved:\n{path}"))

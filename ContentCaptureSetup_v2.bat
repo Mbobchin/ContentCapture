@@ -52,7 +52,7 @@ powershell -Command "Set-ExecutionPolicy RemoteSigned -Scope CurrentUser -Force"
 echo.
 echo  [3/5] Installing dependencies (this may take a few minutes)...
 C:\ContentCapture_v2\venv\Scripts\pip.exe install ^
-    PySide6 opencv-python numpy sounddevice pillow psutil ^
+    PySide6 opencv-python numpy sounddevice pillow psutil av ^
     --quiet
 echo        Core packages installed OK
 
