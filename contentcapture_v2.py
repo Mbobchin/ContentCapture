@@ -571,6 +571,10 @@ DEFAULT_CONFIG = {
     "recording_include_audio": True,
     "recording_audio_codec": "aac",
     "recording_audio_bitrate": 320,
+    # Microphone input (independent from capture card audio)
+    "mic_index": None,
+    "mic_muted": False,
+    "mic_volume": 1.0,
 }
 
 def load_config():
@@ -912,6 +916,100 @@ class AudioEngine:
             result=self.muted
         return result
 
+# ── MIC ENGINE ────────────────────────────────────────────────────────────────
+class MicEngine:
+    """Manages a separate microphone input stream, independent of AudioEngine."""
+
+    def __init__(self, cfg):
+        self._cfg = cfg
+        self._stream = None
+        self._lock = threading.Lock()
+        self.muted = cfg.get("mic_muted", False)
+        self._volume = cfg.get("mic_volume", 1.0)
+        self._buf = collections.deque(maxlen=8)   # small ring of recent chunks
+        self._recorder_ref = None                  # set by MainWindow during recording
+
+    @property
+    def volume(self):
+        with self._lock:
+            return self._volume
+
+    @volume.setter
+    def volume(self, v):
+        with self._lock:
+            self._volume = max(0.0, min(4.0, float(v)))
+
+    def set_recorder(self, recorder_or_none):
+        """Attach or detach a VideoRecorder so mic data is written during recording."""
+        self._recorder_ref = recorder_or_none
+
+    def start(self):
+        idx = self._cfg.get("mic_index", None)
+        sr  = self._cfg.get("audio_sample_rate", 48000)
+        if idx is None:
+            return   # no mic configured — do nothing
+
+        engine = self
+
+        def _make_callback(stereo):
+            def callback(indata, frames, time_info, status):
+                if engine.muted:
+                    return
+                with engine._lock:
+                    vol = engine._volume
+                if stereo:
+                    chunk = indata * vol
+                else:
+                    # mono → duplicate to stereo
+                    chunk = np.column_stack([indata, indata]) * vol
+                np.clip(chunk, -1.0, 1.0, out=chunk)
+                engine._buf.append(chunk.copy())
+                rec = engine._recorder_ref
+                if rec is not None:
+                    try:
+                        rec.write_mic(chunk)
+                    except Exception:
+                        pass
+            return callback
+
+        # Try stereo first; some capture-card devices expose only mono
+        for channels in (2, 1):
+            try:
+                cb = _make_callback(stereo=(channels == 2))
+                self._stream = sd.InputStream(
+                    device=idx,
+                    channels=channels,
+                    samplerate=sr,
+                    dtype="float32",
+                    blocksize=2048,
+                    callback=cb,
+                )
+                self._stream.start()
+                print(f"[Mic] Started — device index {idx}  channels:{channels}  rate:{sr}")
+                return
+            except Exception as e:
+                print(f"[Mic] Failed with channels={channels}: {e}")
+                self._stream = None
+
+        print("[Mic] Could not open microphone device — mic disabled for this session")
+
+    def stop(self):
+        if self._stream:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+
+    def toggle_mute(self):
+        self.muted = not self.muted
+        return self.muted
+
+    def is_running(self):
+        return self._stream is not None and self._stream.active
+
+
 # ── VIDEO RECORDER (PyAV) ─────────────────────────────────────────────────────
 class VideoRecorder:
     """
@@ -930,6 +1028,8 @@ class VideoRecorder:
         self._sample_rate = 48000
         self._channels = 2
         self._audio_buf = np.empty((0,), dtype=np.float32)
+        # Microphone mix buffer — populated by write_mic(), drained in write_audio()
+        self._mic_mix_buf = np.empty((0,), dtype=np.float32)
         self.path = None
 
     def start(self, path, w, h, fps, include_audio=True,
@@ -945,6 +1045,7 @@ class VideoRecorder:
         self._pts_v = 0
         self._pts_a = 0
         self._audio_buf = np.empty((0,), dtype=np.float32)
+        self._mic_mix_buf = np.empty((0,), dtype=np.float32)
 
         try:
             self._container = av.open(path, mode='w')
@@ -991,7 +1092,8 @@ class VideoRecorder:
             print(f"[Recorder] Video write error: {e}")
 
     def write_audio(self, indata_float32):
-        """Write a chunk of float32 stereo audio (shape: [N, channels])."""
+        """Write a chunk of float32 stereo audio (shape: [N, channels]).
+        If mic data is pending in _mic_mix_buf it is additively mixed in."""
         if not self.recording or self._a_stream is None or self._container is None:
             return
         try:
@@ -1003,6 +1105,24 @@ class VideoRecorder:
                 block = self._audio_buf[:samples_needed]
                 self._audio_buf = self._audio_buf[samples_needed:]
                 block_2d = block.reshape(-1, self._channels)
+
+                # ── Mix mic audio if available ────────────────────────────────
+                if len(self._mic_mix_buf) >= samples_needed:
+                    mic_block = self._mic_mix_buf[:samples_needed]
+                    self._mic_mix_buf = self._mic_mix_buf[samples_needed:]
+                    mic_2d = mic_block.reshape(-1, self._channels)
+                    block_2d = block_2d + mic_2d
+                    np.clip(block_2d, -1.0, 1.0, out=block_2d)
+                elif len(self._mic_mix_buf) > 0:
+                    # partial mic data — use what we have, pad the rest with 0
+                    have = (len(self._mic_mix_buf) // self._channels) * self._channels
+                    if have > 0:
+                        mic_partial = self._mic_mix_buf[:have].reshape(-1, self._channels)
+                        self._mic_mix_buf = self._mic_mix_buf[have:]
+                        rows = mic_partial.shape[0]
+                        block_2d[:rows] = block_2d[:rows] + mic_partial
+                        np.clip(block_2d, -1.0, 1.0, out=block_2d)
+
                 av_frame = av.AudioFrame.from_ndarray(
                     block_2d.T.copy(), format='fltp', layout='stereo'
                 )
@@ -1014,6 +1134,23 @@ class VideoRecorder:
                         self._container.mux(pkt)
         except Exception as e:
             print(f"[Recorder] Audio write error: {e}")
+
+    def write_mic(self, chunk_float32):
+        """Append a float32 stereo mic chunk to the mic mix buffer.
+        Called from the MicEngine callback thread — no lock needed because
+        numpy concatenation is GIL-held and _mic_mix_buf is only appended
+        here and consumed in write_audio (same Python thread model)."""
+        if not self.recording or self._a_stream is None:
+            return
+        try:
+            data = chunk_float32.astype(np.float32).flatten()
+            self._mic_mix_buf = np.concatenate([self._mic_mix_buf, data])
+            # Guard against unbounded growth if capture audio never arrives
+            max_samples = self._sample_rate * self._channels * 5  # 5-second cap
+            if len(self._mic_mix_buf) > max_samples:
+                self._mic_mix_buf = self._mic_mix_buf[-max_samples:]
+        except Exception as e:
+            print(f"[Recorder] Mic write error: {e}")
 
     def stop(self):
         if not self.recording:
@@ -1344,11 +1481,12 @@ class BaseDialog(QDialog):
         bf.addWidget(cancel); bf.addWidget(ok); return bf
 
 class AudioDialog(BaseDialog):
-    def __init__(self,parent,cfg,audio):
+    def __init__(self, parent, cfg, audio, mic=None):
         super().__init__(parent,"Audio Settings")
         self.cfg=cfg
         self._audio_engine=audio
-        self.setMinimumWidth(500)
+        self._mic=mic
+        self.setMinimumWidth(520)
         layout=QVBoxLayout(self); layout.setSpacing(16); layout.setContentsMargins(20,20,20,20)
 
         # Header
@@ -1482,6 +1620,126 @@ class AudioDialog(BaseDialog):
         gsync.addRow("",sync_hint)
         layout.addWidget(grp_sync)
 
+        # ── Microphone ────────────────────────────────────────────────────────
+        grp_mic = self._section("Microphone Input"); gmic = QVBoxLayout(grp_mic)
+        gmic.setSpacing(12); gmic.setContentsMargins(12, 16, 12, 12)
+
+        # Device selector
+        mic_dev_row = QHBoxLayout(); mic_dev_row.setSpacing(8)
+        mic_dev_lbl = QLabel("Device:")
+        mic_dev_lbl.setStyleSheet(f"color:{C['text2']};font-size:10pt;")
+        mic_dev_lbl.setFixedWidth(68)
+        self._mic_combo = QComboBox()
+        self._mic_combo.setToolTip(
+            "Select a microphone input device. 'None' disables the mic track.")
+
+        # Populate: None + all input devices (exclude capture card input to avoid confusion)
+        capture_idx = cfg.get("audio_input_index", -1)
+        self._mic_combo.addItem("None (disabled)", None)
+        try:
+            for i, d in enumerate(sd.query_devices()):
+                if d["max_input_channels"] > 0:
+                    marker = "  [capture card]" if i == capture_idx else ""
+                    self._mic_combo.addItem(
+                        f"\U0001f3a4  [{i}] {d['name'][:48]}{marker}", i)
+        except Exception:
+            pass
+
+        # Restore saved selection
+        saved_mic_idx = cfg.get("mic_index", None)
+        if saved_mic_idx is not None:
+            for j in range(self._mic_combo.count()):
+                if self._mic_combo.itemData(j) == saved_mic_idx:
+                    self._mic_combo.setCurrentIndex(j)
+                    break
+
+        def _on_mic_device_changed(idx):
+            cfg["mic_index"] = self._mic_combo.currentData()
+
+        self._mic_combo.currentIndexChanged.connect(_on_mic_device_changed)
+        mic_dev_row.addWidget(mic_dev_lbl)
+        mic_dev_row.addWidget(self._mic_combo, 1)
+        gmic.addLayout(mic_dev_row)
+
+        # Mute button — live toggle (survives dialog close via the MicEngine reference)
+        self._mic_mute_btn = QPushButton()
+        mic_muted_init = cfg.get("mic_muted", False) if mic is None else mic.muted
+        self._mic_muted = mic_muted_init
+
+        def _refresh_mic_btn():
+            if self._mic_muted:
+                self._mic_mute_btn.setText("\U0001f3a4  MIC MUTED  (click to unmute)")
+                self._mic_mute_btn.setObjectName("danger")
+            else:
+                self._mic_mute_btn.setText("\U0001f3a4  MIC LIVE  (click to mute)")
+                self._mic_mute_btn.setObjectName("accent")
+            self._mic_mute_btn.setStyle(self._mic_mute_btn.style())
+
+        def _toggle_mic_mute_btn():
+            if mic is not None:
+                self._mic_muted = mic.toggle_mute()
+            else:
+                self._mic_muted = not self._mic_muted
+            cfg["mic_muted"] = self._mic_muted
+            _refresh_mic_btn()
+
+        self._mic_mute_btn.setFixedHeight(38)
+        self._mic_mute_btn.setToolTip("Toggle microphone mute without restarting the stream")
+        self._mic_mute_btn.clicked.connect(_toggle_mic_mute_btn)
+        _refresh_mic_btn()
+        gmic.addWidget(self._mic_mute_btn)
+
+        # Volume row: slider + spinbox (0–200%)
+        mic_vol_row = QHBoxLayout(); mic_vol_row.setSpacing(10)
+        mic_vol_lbl = QLabel("Mic Volume:")
+        mic_vol_lbl.setStyleSheet(f"color:{C['text2']};font-size:10pt;")
+        mic_vol_lbl.setFixedWidth(80)
+
+        init_mic_vol = int((cfg.get("mic_volume", 1.0) if mic is None else mic.volume) * 100)
+        self._mic_vol_slider = QSlider(Qt.Horizontal)
+        self._mic_vol_slider.setRange(0, 200)
+        self._mic_vol_slider.setValue(init_mic_vol)
+        self._mic_vol_slider.setToolTip("Microphone gain (0=silent, 100=unity, 200=boost)")
+        self._mic_vol_spin = QSpinBox()
+        self._mic_vol_spin.setRange(0, 200)
+        self._mic_vol_spin.setSuffix("%")
+        self._mic_vol_spin.setFixedWidth(76)
+        self._mic_vol_spin.setValue(init_mic_vol)
+        self._mic_vol_spin.setToolTip("Type mic volume directly")
+
+        def _on_mic_vol_slider(v):
+            self._mic_vol_spin.blockSignals(True)
+            self._mic_vol_spin.setValue(v)
+            self._mic_vol_spin.blockSignals(False)
+            cfg["mic_volume"] = v / 100.0
+            if mic is not None:
+                mic.volume = v / 100.0
+
+        def _on_mic_vol_spin(v):
+            self._mic_vol_slider.blockSignals(True)
+            self._mic_vol_slider.setValue(v)
+            self._mic_vol_slider.blockSignals(False)
+            cfg["mic_volume"] = v / 100.0
+            if mic is not None:
+                mic.volume = v / 100.0
+
+        self._mic_vol_slider.valueChanged.connect(_on_mic_vol_slider)
+        self._mic_vol_spin.valueChanged.connect(_on_mic_vol_spin)
+        mic_vol_row.addWidget(mic_vol_lbl)
+        mic_vol_row.addWidget(self._mic_vol_slider, 1)
+        mic_vol_row.addWidget(self._mic_vol_spin)
+        gmic.addLayout(mic_vol_row)
+
+        mic_note = QLabel(
+            "Changes to device selection take effect on the next stream restart.\n"
+            "Mute and volume adjust live."
+        )
+        mic_note.setWordWrap(True)
+        mic_note.setStyleSheet(f"color:{C['subtext']};font-size:9pt;background:transparent;")
+        gmic.addWidget(mic_note)
+
+        layout.addWidget(grp_mic)
+
         # Info note
         note=QLabel("Volume above 100% amplifies the signal (may clip).")
         note.setStyleSheet(f"color:{C['subtext']};font-size:9pt;background:transparent;")
@@ -1505,8 +1763,12 @@ class AudioDialog(BaseDialog):
         )
 
     def accept(self):
-        self.cfg["audio_sample_rate"]=self.sr_combo.currentData()
-        self.cfg["audio_delay_ms"]=self.sync_spin.value()
+        self.cfg["audio_sample_rate"] = self.sr_combo.currentData()
+        self.cfg["audio_delay_ms"]    = self.sync_spin.value()
+        # Mic settings (device & muted already updated live; persist final values)
+        self.cfg["mic_index"]  = self._mic_combo.currentData()
+        self.cfg["mic_muted"]  = self._mic_muted
+        self.cfg["mic_volume"] = self._mic_vol_spin.value() / 100.0
         self.close()
 
 class ImageDialog(BaseDialog):
@@ -2229,6 +2491,7 @@ class MainWindow(QMainWindow):
         self.clip_buf=ClipBuffer(self.cfg["clip_duration"],self.cfg["fps"])
         self.audio=None; self.vthread=None; self.running=False
         self._raw_frame=None; self._frame_lock=threading.Lock(); self._sys_data={}
+        self.mic=MicEngine(self.cfg)
         self.fs_mode=False
         # Global hotkey manager — bridges keyboard lib callbacks to the Qt thread
         self._global_hk = GlobalHotkeyManager(self)
@@ -2306,6 +2569,10 @@ class MainWindow(QMainWindow):
         self._mute_action=self._tact("\U0001f50a  MUTE", self.toggle_mute,
                                      "Toggle audio mute  [M]")
         self.toolbar.addAction(self._mute_action)
+        self._mic_action=self._tact("\U0001f3a4  MIC", self._toggle_mic_mute,
+                                    "Toggle microphone mute")
+        self._mic_action.setCheckable(True)
+        self.toolbar.addAction(self._mic_action)
         self.toolbar.addSeparator()
 
         # ── Recording group ───────────────────────────────────────────────────
@@ -2816,6 +3083,9 @@ class MainWindow(QMainWindow):
             self.cfg.get("contrast",1.0),
             self.cfg.get("saturation",1.0),
         )
+        # Start microphone (no-op if mic_index is None)
+        self.mic.start()
+        self._update_mic_action()
         self.running=True; self.perf.reset()
         # Update status pill and toolbar action
         self.status_pill.set_state("\u25cf LIVE", C["live"])
@@ -2834,6 +3104,7 @@ class MainWindow(QMainWindow):
         self.running=False
         if self.recorder.recording: self.stop_recording()
         if self.vthread: self.vthread.stop(); self.vthread=None
+        self.mic.stop()
         if self.audio: self.audio.stop(); self.audio=None
         # Update status pill and toolbar action
         self.status_pill.set_state("OFFLINE", C["danger"])
@@ -2902,6 +3173,30 @@ class MainWindow(QMainWindow):
         self._sb_audio.setText(f"  \U0001f50a {pct}%  ")
         self._sb_audio.setStyleSheet(f"color:{col};font-size:9pt;border-right:1px solid {C['border']};")
 
+    def _toggle_mic_mute(self):
+        """Toggle microphone mute and refresh the toolbar button state."""
+        muted = self.mic.toggle_mute()
+        self.cfg["mic_muted"] = muted
+        self._update_mic_action()
+
+    def _update_mic_action(self):
+        """Refresh the MIC toolbar action appearance to reflect current state."""
+        no_mic = self.cfg.get("mic_index", None) is None
+        if no_mic:
+            self._mic_action.setEnabled(False)
+            self._mic_action.setChecked(False)
+            self._mic_action.setToolTip(
+                "No microphone configured — open Audio Settings to select one")
+        else:
+            self._mic_action.setEnabled(True)
+            muted = self.mic.muted
+            self._mic_action.setChecked(muted)
+            self._mic_action.setText(
+                "\U0001f3a4  MIC OFF" if muted else "\U0001f3a4  MIC")
+            self._mic_action.setToolTip(
+                "Microphone muted — click to unmute" if muted
+                else "Microphone active — click to mute")
+
     def _reset_image(self):
         if self.vthread: self.vthread.set_image(1.0,1.0,1.0)
 
@@ -2934,14 +3229,18 @@ class MainWindow(QMainWindow):
         # Attach recorder to AudioEngine so the sounddevice callback feeds audio
         if include_audio and self.audio is not None:
             self.audio.set_recorder(self.recorder)
+        # Attach recorder to MicEngine so mic audio is mixed in (if mic is running)
+        if include_audio:
+            self.mic.set_recorder(self.recorder)
 
         self.rec_pill.set_state("\u23fa REC", C["record"]); self.rec_pill.show()
         self._rec_start_time=time.time(); self._rec_timer.start()
 
     def stop_recording(self):
-        # Detach recorder from AudioEngine before stopping so no more audio is written
+        # Detach recorder from AudioEngine and MicEngine before stopping
         if self.audio is not None:
             self.audio.set_recorder(None)
+        self.mic.set_recorder(None)
         path=self.recorder.stop(); self.rec_pill.hide()
         self._rec_timer.stop(); self._rec_start_time=None; self._update_rec_duration()
         if path: QTimer.singleShot(100,lambda:QMessageBox.information(self,"Saved",f"Recording saved:\n{path}"))
@@ -3010,7 +3309,7 @@ class MainWindow(QMainWindow):
         else: flags&=~Qt.WindowStaysOnTopHint
         self.setWindowFlags(flags); self.show()
     def _open_folder(self,path): os.makedirs(path,exist_ok=True); os.startfile(path)
-    def _open_audio(self): AudioDialog(self,self.cfg,self.audio).exec()
+    def _open_audio(self): AudioDialog(self,self.cfg,self.audio,self.mic).exec()
     def _open_image(self): ImageDialog(self,self.vthread,self.cfg).exec()
     def _open_upscale(self):
         dlg=UpscaleDialog(self,self.cfg)
