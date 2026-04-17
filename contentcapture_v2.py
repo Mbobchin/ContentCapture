@@ -30,7 +30,7 @@ from PySide6.QtGui import (
 )
 
 APP_NAME    = "ContentCapture"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.3.1"
 APP_TAGLINE = "Capture card viewer for Windows with GPU acceleration"
 CONFIG_FILE = os.path.join(os.environ.get("APPDATA",""), "ContentCapture", "config.json")
 
@@ -3873,13 +3873,12 @@ def main():
     app=QApplication(sys.argv)
     app.setApplicationName(APP_NAME); app.setApplicationVersion(APP_VERSION); app.setStyle("Fusion")
 
-    # BUG5: Pre-populate device caches before creating MainWindow so DeviceDialog
-    # and AudioDialog open instantly on first use (no blocking scan on UI thread).
-    print("[Startup] Scanning video devices…")
-    find_video_devices()
-    print("[Startup] Scanning audio devices…")
+    # Pre-populate audio device cache at startup (fast, no device lockout risk).
+    # Video device cache is populated lazily on first DeviceDialog open — opening
+    # the capture card here and immediately releasing it can cause MSMF drivers to
+    # enter a brief exclusive-access lockout that prevents VideoThread from opening
+    # the same device seconds later.
     _populate_audio_cache()
-    print("[Startup] Device scan complete.")
 
     win=MainWindow(); win.show(); sys.exit(app.exec())
 
